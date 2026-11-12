@@ -64,7 +64,7 @@ wg0_up() {
     _allowed=$(conf_get AllowedIPs "$CONF")
     if [ -n "$_allowed" ]; then
         echo "$_allowed" | tr ',' '\n' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | grep -v '^$' \
-            | sed "s|^|replace |; s|\$| dev $WG0|" > /run/routes.batch
+            | sed "s|^|route replace |; s|\$| dev $WG0|" > /run/routes.batch
         ip -4 -batch /run/routes.batch >/dev/null 2>&1 || log "wg0: часть маршрутов не применилась"
     fi
 
