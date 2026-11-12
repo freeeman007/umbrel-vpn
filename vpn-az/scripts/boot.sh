@@ -16,7 +16,7 @@ apk add --no-cache wireguard-tools iptables iproute2 dnsmasq python3 curl ca-cer
 
 fetch() {
     for i in 1 2 3; do
-        if curl -fsS --max-time 30 "$RAW/$1" -o "$DATA/$1.new" 2>/dev/null; then
+        if curl -fsS --max-time 30 "$RAW/$1?v=$(date +%s)" -o "$DATA/$1.new" 2>/dev/null; then
             mv "$DATA/$1.new" "$DATA/$1"
             log "обновлён $1"
             return 0
