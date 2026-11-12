@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-# app.py — статус и API приложения vpn-az (AntiZapret Client для Umbrel).
+# app.py — статус и API приложения vpn-az (VPN-клиент своего AZ-узла для Umbrel).
 # Только stdlib. Слушает 0.0.0.0:8666, сеть хоста (network_mode: host).
 import json
 import os
 import re
+import secrets
 import subprocess
 import threading
 import time
@@ -12,109 +13,111 @@ from urllib.parse import urlparse, parse_qs
 
 DATA = os.environ.get("DATA", "/data")
 PORT = int(os.environ.get("APP_PORT", "8666"))
-TOKEN = os.environ.get("APP_PASSWORD", "")
-RELAY = os.environ.get("AZ_RELAY_ENDPOINT", "deha.mediaconf.tech:51920")
-DNS_PORT = os.environ.get("DNS_PORT", "5399")
+OVPN_CONF = os.path.join(DATA, "client.ovpn")
 WG_CONF = os.path.join(DATA, "wg0.conf")
-PHONE_DIR = os.path.join(DATA, "wgphone")
-PHONE_CONF = os.path.join(PHONE_DIR, "server.conf")
-CLIENTS_DIR = os.path.join(PHONE_DIR, "clients")
+NET_SH = os.path.join(DATA, "net.sh")
+DNS_PORT = os.environ.get("DNS_PORT", "5399")
+OVPN_DEV = "azvpn"
 
 EGRESS = {"direct": None, "tunnel": None, "at": 0}
+TOKEN = (os.environ.get("APP_PASSWORD") or "").strip()
 
 
-def run(cmd, timeout=8, stdin=None):
+def data_path(name):
+    return os.path.join(DATA, name)
+
+
+def token():
+    global TOKEN
+    if TOKEN:
+        return TOKEN
+    p = data_path("api_token")
     try:
-        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout,
-                              input=stdin, shell=isinstance(cmd, str)).stdout.strip()
+        TOKEN = open(p).read().strip()
+    except OSError:
+        TOKEN = ""
+    if not TOKEN:
+        TOKEN = secrets.token_hex(24)
+        with open(p, "w") as f:
+            f.write(TOKEN)
+        os.chmod(p, 0o600)
+    return TOKEN
+
+
+def run(cmd, timeout=10):
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout,
+                           shell=isinstance(cmd, str))
+        return (r.stdout or "").strip()
     except Exception:
         return ""
 
 
-def conf_get(path, key):
+def sh(script, timeout=60):
     try:
-        with open(path) as f:
-            for line in f:
-                m = re.match(r"\s*%s\s*=\s*(.+)" % re.escape(key), line)
-                if m:
-                    return m.group(1).strip()
-    except OSError:
-        pass
-    return ""
+        r = subprocess.run(["/bin/sh", "-c", script], capture_output=True, text=True, timeout=timeout)
+        return ((r.stdout or "") + (r.stderr or "")).strip()
+    except Exception as e:
+        return "err: %s" % e
 
 
-def iface_exists(name):
-    return os.path.exists("/sys/class/net/%s" % name)
+def iface_exists(n):
+    return os.path.exists("/sys/class/net/%s" % n)
 
 
-def wg_dump(name):
-    out = run(["wg", "show", name, "dump"])
-    return out.splitlines() if out else []
+def tun_ip():
+    out = run(["ip", "-4", "-o", "addr", "show", "dev", OVPN_DEV])
+    m = re.search(r"inet ([0-9.]+)/", out)
+    return m.group(1) if m else ""
 
 
-def wg_stats(name):
-    peers = []
-    lines = wg_dump(name)
-    if len(lines) < 2:
-        return {"up": iface_exists(name), "peers": peers}
-    for line in lines[1:]:
-        f = line.split("\t")
-        if len(f) < 8:
-            continue
-        hs = int(f[4] or 0)
-        peers.append({
-            "pubkey": f[0][:12],
-            "endpoint": f[2],
-            "allowed": f[3],
-            "handshake_age": (int(time.time()) - hs) if hs else None,
-            "rx": int(f[5] or 0),
-            "tx": int(f[6] or 0),
-        })
-    return {"up": True, "peers": peers}
+def ovpn_alive():
+    try:
+        pid = int(open(data_path("ovpn.pid")).read().strip())
+        os.kill(pid, 0)
+        return True
+    except Exception:
+        return bool(run("pgrep -f 'openvpn --config %s'" % OVPN_CONF))
+
+
+def mode():
+    if os.path.exists(OVPN_CONF):
+        return "openvpn"
+    if os.path.exists(WG_CONF):
+        return "wireguard"
+    return "none"
 
 
 def dns_ok():
-    try:
-        out = run("ss -lnuH | grep -c ':%s '" % DNS_PORT, timeout=5)
-        return int(out or 0) > 0
-    except Exception:
-        return False
+    return run("ss -lnuH | grep -c ':%s '" % DNS_PORT) not in ("", "0")
+
+
+def ip_forward():
+    return run(["cat", "/proc/sys/net/ipv4/ip_forward"]) == "1"
 
 
 def egress_loop():
     global EGRESS
     while True:
         direct = None
-        try:
-            out = subprocess.run(
-                ["curl", "-s", "--max-time", "5", "https://ifconfig.me"],
-                capture_output=True, text=True, timeout=8).stdout.strip()
-            if re.fullmatch(r"[0-9.]{7,15}", out):
-                direct = out
-        except Exception:
-            pass
+        out = run(["curl", "-s", "--max-time", "5", "https://ifconfig.me"])
+        if re.fullmatch(r"[0-9.]{7,15}", out or ""):
+            direct = out
         tunnel = None
-        try:
-            out = subprocess.run(
-                ["curl", "-s", "--max-time", "6", "--interface", "wg0",
-                 "https://ifconfig.me"],
-                capture_output=True, text=True, timeout=9).stdout.strip()
-            if re.fullmatch(r"[0-9.]{7,15}", out):
+        dev = OVPN_DEV if iface_exists(OVPN_DEV) else ("wg0" if iface_exists("wg0") else None)
+        if dev:
+            out = run(["curl", "-s", "--max-time", "6", "--interface", dev, "https://ifconfig.me"])
+            if re.fullmatch(r"[0-9.]{7,15}", out or ""):
                 tunnel = out
-        except Exception:
-            pass
-        EGRESS = {"direct": EGRESS.get("direct") if EGRESS else direct,
-                  "tunnel": tunnel or (EGRESS.get("tunnel") if EGRESS else None),
+        EGRESS = {"direct": direct or EGRESS.get("direct"), "tunnel": tunnel or EGRESS.get("tunnel"),
                   "at": int(time.time())}
         time.sleep(120)
 
 
-def dns_a(name, port=None, server="127.0.0.1"):
-    """Минимальный DNS-запрос A-записи напрямую на локальный резолвер."""
+def dns_a(name):
     import socket
     import struct
     import random
-    port = int(port or DNS_PORT)
     tid = random.randint(0, 65535)
     q = struct.pack(">HHHHHH", tid, 0x0100, 1, 0, 0, 0)
     for part in name.rstrip(".").split("."):
@@ -123,7 +126,7 @@ def dns_a(name, port=None, server="127.0.0.1"):
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     s.settimeout(5)
     try:
-        s.sendto(q, (server, port))
+        s.sendto(q, ("127.0.0.1", int(DNS_PORT)))
         data, _ = s.recvfrom(4096)
     finally:
         s.close()
@@ -140,7 +143,7 @@ def dns_a(name, port=None, server="127.0.0.1"):
             while data[i] != 0:
                 i += 1 + data[i]
             i += 1
-        rtype, _rclass, _ttl, rdlen = struct.unpack(">HHIH", data[i:i + 10])
+        rtype, _c, _ttl, rdlen = struct.unpack(">HHIH", data[i:i + 10])
         i += 10
         if rtype == 1 and rdlen == 4:
             out.append(".".join(str(b) for b in data[i:i + 4]))
@@ -148,158 +151,132 @@ def dns_a(name, port=None, server="127.0.0.1"):
     return out
 
 
+def ovpn_meta():
+    """Что видно в профиле, без секретов."""
+    if not os.path.exists(OVPN_CONF):
+        return {}
+    meta: dict = {"remotes": []}
+    try:
+        with open(OVPN_CONF, errors="ignore") as f:
+            for line in f:
+                m = re.match(r"\s*remote\s+(\S+)\s+(\d+)", line)
+                if m:
+                    meta["remotes"].append("%s:%s" % (m.group(1), m.group(2)))
+                if "redirect-gateway" in line or re.match(r"\s*route\s+0\.0\.0\.0\s+0\.0\.0\.0", line):
+                    meta["full_tunnel"] = True
+    except OSError:
+        pass
+    return meta
+
+
 def status():
+    m = mode()
     st = {
         "time": int(time.time()),
-        "config_present": os.path.exists(WG_CONF),
-        "az_address": conf_get(WG_CONF, "Address"),
-        "az_endpoint": conf_get(WG_CONF, "Endpoint"),
-        "routes": len(run("ip -4 route show dev wg0").splitlines()),
-        "dns": {"listening": dns_ok(), "port": DNS_PORT, "override": os.path.exists(os.path.join(DATA, "dns_on")),
-                "upstream": os.environ.get("AZ_DNS_UPSTREAM", "")},
-        "wg0": wg_stats("wg0"),
-        "wgphone": wg_stats("wgphone"),
-        "relay": RELAY,
+        "mode": m,
+        "lan_access": os.path.exists(data_path("lan_access")),
+        "forwarding": ip_forward(),
+        "dns": {"port": DNS_PORT, "listening": dns_ok(),
+                "override": os.path.exists(data_path("dns_on")),
+                "upstream": os.environ.get("AZ_DNS_UPSTREAM", "1.1.1.1")},
         "egress": EGRESS,
-        "forwarding": run(["cat", "/proc/sys/net/ipv4/ip_forward"]) == "1",
     }
-    if os.path.exists(PHONE_CONF):
-        st["wgphone"]["port"] = conf_get(PHONE_CONF, "ListenPort")
-        st["wgphone"]["address"] = conf_get(PHONE_CONF, "Address")
+    if m == "openvpn":
+        st["tunnel"] = {
+            "dev": OVPN_DEV,
+            "alive": ovpn_alive(),
+            "ip": tun_ip(),
+            "routes": len(run(["ip", "-4", "route", "show", "dev", OVPN_DEV]).splitlines()),
+            "default_via_tunnel": OVPN_DEV in run(["ip", "-4", "route", "show", "default"]),
+            "meta": ovpn_meta(),
+        }
+    elif m == "wireguard":
+        peers = []
+        for line in run(["wg", "show", "wg0", "dump"]).splitlines()[1:]:
+            f = line.split("\t")
+            if len(f) >= 8:
+                hs = int(f[4] or 0)
+                peers.append({"endpoint": f[2], "allowed": f[3],
+                              "handshake_age": (int(time.time()) - hs) if hs else None,
+                              "rx": int(f[5] or 0), "tx": int(f[6] or 0)})
+        st["tunnel"] = {"dev": "wg0", "alive": iface_exists("wg0"), "peers": peers,
+                        "routes": len(run(["ip", "-4", "route", "show", "dev", "wg0"]).splitlines())}
     return st
 
 
-def peers_list():
-    out = []
-    if not os.path.isdir(CLIENTS_DIR):
-        return out
-    for name in sorted(os.listdir(CLIENTS_DIR)):
-        if name.endswith(".conf"):
-            out.append(name[:-5])
-    return out
-
-
-def genkey():
-    return run(["wg", "genkey"])
-
-
-def pubkey(priv):
-    return run(["wg", "pubkey"], stdin=priv + "\n")
-
-
-def genpsk():
-    return run(["wg", "genpsk"])
-
-
-def ensure_server():
-    os.makedirs(CLIENTS_DIR, exist_ok=True)
-    if os.path.exists(PHONE_CONF) and conf_get(PHONE_CONF, "PrivateKey"):
-        # миграция порта: 51820 занят приложением WireGuard на этом же хосте
-        txt = open(PHONE_CONF).read()
-        new = re.sub(r"ListenPort\s*=\s*\d+", "ListenPort = 51920", txt)
-        if new != txt:
-            with open(PHONE_CONF, "w") as f:
-                f.write(new)
-            os.chmod(PHONE_CONF, 0o600)
-        return
-    priv = genkey()
-    conf = ("[Interface]\nAddress = 10.77.0.1/24\nListenPort = 51920\nMTU = 1280\n"
-            "PrivateKey = %s\n" % priv)
-    with open(PHONE_CONF, "w") as f:
-        f.write(conf)
-    os.chmod(PHONE_CONF, 0o600)
-
-
-def add_peer(name):
-    name = re.sub(r"[^A-Za-z0-9_-]", "", name)[:32]
-    if not name:
-        return None, "пустое имя"
-    ensure_server()
-    conf = open(PHONE_CONF).read()
-    if "# Client = %s\n" % name in conf:
-        return None, "такой профиль уже есть"
-    used = set(re.findall(r"AllowedIPs = 10\.77\.0\.(\d+)", conf))
-    ip = next((i for i in range(2, 250) if str(i) not in used), None)
-    if ip is None:
-        return None, "кончились адреса"
-    cli_priv = genkey()
-    cli_pub = pubkey(cli_priv)
-    srv_pub = pubkey(conf_get(PHONE_CONF, "PrivateKey"))
-    psk = genpsk()
-    with open(PHONE_CONF, "a") as f:
-        f.write("\n# Client = %s\n[Peer]\nPublicKey = %s\nPresharedKey = %s\n"
-                "AllowedIPs = 10.77.0.%d/32\n" % (name, cli_pub, psk, ip))
-    # порт в профиле всегда равен фактическому ListenPort сервера
-    host = RELAY.rsplit(":", 1)[0] if ":" in RELAY else RELAY
-    port = conf_get(PHONE_CONF, "ListenPort") or "51920"
-    client = ("[Interface]\nPrivateKey = %s\nAddress = 10.77.0.%d/32\n"
-              "DNS = 10.77.0.1\nMTU = 1280\n\n[Peer]\nPublicKey = %s\n"
-              "PresharedKey = %s\nEndpoint = %s:%s\nAllowedIPs = 0.0.0.0/0\n"
-              "PersistentKeepalive = 25\n" % (cli_priv, ip, srv_pub, psk, host, port))
-    os.makedirs(CLIENTS_DIR, exist_ok=True)
-    with open(os.path.join(CLIENTS_DIR, name + ".conf"), "w") as f:
-        f.write(client)
-    os.chmod(os.path.join(CLIENTS_DIR, name + ".conf"), 0o600)
-    subprocess.Popen(["/bin/sh", "-c", "sh %s/net.sh up >> %s/net.log 2>&1" % (DATA, DATA)])
-    return client, None
+def apply_net(arg="apply"):
+    sh("sh %s %s >> %s/net.log 2>&1" % (NET_SH, arg, DATA))
 
 
 PAGE = """<!doctype html><html lang="ru"><head><meta charset="utf-8">
-<title>AntiZapret Client</title><meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>VPN AZ — Umbrel</title>
 <style>
-body{background:#0f1216;color:#dfe6ee;font:15px/1.5 system-ui,sans-serif;margin:0;padding:24px}
-h1{font-size:19px;margin:0 0 4px} .m{color:#8b97a5;font-size:13px;margin-bottom:18px}
-table{border-collapse:collapse;width:100%;max-width:760px;margin-bottom:22px}
-td{padding:6px 10px;border-bottom:1px solid #1d232b} td:first-child{color:#8b97a5;width:44%}
-.ok{color:#4ade80} .bad{color:#f87171} .warn{color:#fbbf24}
-textarea,button,input{font:inherit;background:#151a21;color:#dfe6ee;border:1px solid #26303b;border-radius:8px;padding:8px}
-textarea{width:100%;max-width:760px;height:170px} button{cursor:pointer;background:#1d2733}
-pre{background:#151a21;border:1px solid #26303b;border-radius:8px;padding:12px;overflow:auto;max-width:760px}
+body{font:15px/1.5 system-ui,-apple-system,Segoe UI,Roboto,sans-serif;margin:0;padding:24px;background:#0f1115;color:#e6e6e6}
+h1{font-size:19px;margin:0 0 4px}
+.sub{color:#8b93a1;font-size:13px;margin-bottom:18px}
+.card{background:#171a21;border:1px solid #232735;border-radius:12px;padding:16px;margin-bottom:14px;max-width:760px}
+.row{display:flex;justify-content:space-between;gap:12px;padding:5px 0;border-bottom:1px solid #1e222d}
+.row:last-child{border-bottom:0}
+.k{color:#8b93a1}.v{font-variant-numeric:tabular-nums;text-align:right;word-break:break-all}
+.ok{color:#3ddc84}.bad{color:#ff6b6b}
+button{background:#2a3040;color:#e6e6e6;border:1px solid #39415a;border-radius:8px;padding:7px 12px;cursor:pointer;font-size:13px}
+button:hover{background:#333b4e}
+textarea{width:100%;height:120px;background:#0f1115;color:#cfd4e0;border:1px solid #2b3143;border-radius:8px;padding:10px;font:12px/1.4 ui-monospace,monospace;box-sizing:border-box}
+.tools{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px}
+pre{white-space:pre-wrap;font:12px/1.45 ui-monospace,monospace;color:#b9c0cf;margin:8px 0 0}
 </style></head><body>
-<h1>AntiZapret Client</h1>
-<div class="m">Umbrel &rarr; деха · обновлено <span id="t">__TS__</span></div>
-<table id="s"></table>
-<details><summary>Загрузить wg0.conf (сплит-профиль AZ)</summary>
-<form method="post" action="/api/config">
-<input type="hidden" name="token" value="__TOKEN__">
-<textarea name="conf" placeholder="[Interface]&#10;PrivateKey = ...&#10;Address = 10.29.8.7/32&#10;..."></textarea>
-<p><button type="submit">Сохранить и применить</button></p></form></details>
-<details><summary>Профили для телефона</summary>
-<form method="post" action="/api/peer">
-<input type="hidden" name="token" value="__TOKEN__">
-<input name="name" placeholder="имя устройства"><button type="submit">Создать профиль</button></form>
-<pre id="peers">—</pre></details>
+<h1>VPN AZ — Umbrel</h1>
+<div class="sub">Туннель к своему AZ-узлу, без зависимости от роутера</div>
+<div class="card" id="st">загрузка…</div>
+<div class="card">
+  <div class="k" style="margin-bottom:8px">Профиль .ovpn из панели AZ (client.sh) — вставь целиком</div>
+  <textarea id="conf" placeholder="client&#10;dev tun&#10;remote 5.39.253.63 50080 udp4&#10;..."></textarea>
+  <div class="tools">
+    <button onclick="post('/api/config', document.getElementById('conf').value)">Загрузить профиль</button>
+    <button onclick="post('/api/dns_on?on=' + (S.dns.override?0:1))">Перехват DNS</button>
+    <button onclick="post('/api/lan?on=' + (S.lan_access?0:1))">NAT в домашнюю сеть</button>
+    <button onclick="post('/api/restart')">Перезапустить туннель</button>
+    <button onclick="load()">Обновить</button>
+  </div>
+  <pre id="out"></pre>
+</div>
 <script>
-async function upd(){
- const j = await (await fetch('/status.json')).json();
- const rows = [
-  ['wg0', j.wg0.up ? '<span class=ok>поднят</span>' : '<span class=bad>нет</span>'],
-  ['AZ-адрес', j.az_address || '—'],
-  ['эндпоинт', j.az_endpoint || '—'],
-  ['маршрутов в туннель', j.routes],
-  ['рукопожатие', j.wg0.peers.length ? (j.wg0.peers[0].handshake_age === null ? '<span class=bad>никогда</span>' :
-      (j.wg0.peers[0].handshake_age < 180 ? '<span class=ok>'+j.wg0.peers[0].handshake_age+' c</span>' :
-       '<span class=warn>'+j.wg0.peers[0].handshake_age+' c</span>')) : '—'],
-  ['DNS-резолвер', j.dns.listening ? '<span class=ok>:'+j.dns.port+' → '+j.dns.upstream+'</span>' : '<span class=bad>не слушает</span>'],
-  ['выход напрямую', j.egress.direct || '—'],
-  ['выход через туннель', j.egress.tunnel || '—'],
-  ['WG-сервер (телефон)', (j.wgphone.up ? '<span class=ok>10.77.0.1:'+(j.wgphone.port||'')+'</span>' : '<span class=bad>не поднят</span>')],
-  ['релей снаружи', j.relay],
- ];
- document.getElementById('s').innerHTML = rows.map(r=>'<tr><td>'+r[0]+'</td><td>'+r[1]+'</td></tr>').join('');
- document.getElementById('t').textContent = new Date(j.time*1000).toLocaleTimeString();
- const p = await (await fetch('/api/peers')).json();
- document.getElementById('peers').textContent = p.peers.length ? p.peers.join('\\n') : '—';
+let S={};
+const T=new URLSearchParams(location.search).get('token')||'';
+async function load(){
+  const r=await fetch('/status.json',{headers:{'X-Auth-Token':T}});
+  S=await r.json(); render();
 }
-upd(); setInterval(upd, 15000);
+function render(){
+  const t=S.tunnel||{}; const rows=[];
+  rows.push(['Режим', S.mode]);
+  if(S.mode==='openvpn'){
+    rows.push(['Туннель', t.alive?'поднят':'нет']);
+    rows.push(['Адрес в туннеле', t.ip||'—']);
+    rows.push(['Маршрутов через туннель', t.routes]);
+    rows.push(['Весь трафик через VPN', t.default_via_tunnel?'да':'нет']);
+    rows.push(['Сервер', (t.meta&&t.meta.remotes||[]).join(', ')||'—']);
+  }
+  rows.push(['DNS :'+S.dns.port, (S.dns.listening?'слушает':'нет')+(S.dns.override?' · перехват вкл':' · перехват выкл')]);
+  rows.push(['Выход напрямую', S.egress.direct||'—']);
+  rows.push(['Выход через туннель', S.egress.tunnel||'—']);
+  rows.push(['NAT в домашнюю сеть', S.lan_access?('вкл'+(S.forwarding?'':' (forwarding off!)')):'выкл']);
+  document.getElementById('st').innerHTML=rows.map(function(r){
+    const k=r[0], v=String(r[1]);
+    const cls=(v==='да'||v==='поднят'||v==='слушает'||v==='openvpn')?'ok':(v==='нет'||v==='—'||v==='none')?'bad':'';
+    return '<div class="row"><span class="k">'+k+'</span><span class="v '+cls+'">'+v+'</span></div>';
+  }).join('');
+}
+async function post(u,body){
+  const o={method:'POST',headers:{'X-Auth-Token':T}};
+  if(body!==undefined){o.body=body;}
+  const r=await fetch(u,o); const j=await r.json().catch(function(){return {};});
+  document.getElementById('out').textContent=JSON.stringify(j,null,1);
+  setTimeout(load,1500);
+}
+load(); setInterval(load,10000);
 </script></body></html>"""
-
-API_TOKEN = ""
-
-
-def page():
-    return (PAGE.replace("__TS__", time.strftime("%H:%M:%S"))
-                .replace("__TOKEN__", API_TOKEN))
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -314,13 +291,9 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
-    def _auth(self, raw):
-        if TOKEN and self.headers.get("X-Auth-Token") == TOKEN:
-            return True
-        if raw and API_TOKEN:
-            if parse_qs(raw).get("token", [""])[0] == API_TOKEN:
-                return True
-        return False
+    def _auth(self, u):
+        tok = self.headers.get("X-Auth-Token") or (parse_qs(u.query).get("token") or [""])[0]
+        return tok == token()
 
     def log_message(self, fmt, *args):
         pass
@@ -328,19 +301,11 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         u = urlparse(self.path)
         if u.path in ("/", "/index.html"):
-            return self._send(200, page(), "text/html; charset=utf-8")
+            return self._send(200, PAGE, "text/html; charset=utf-8")
+        if not self._auth(u):
+            return self._send(403, json.dumps({"error": "auth"}))
         if u.path == "/status.json":
             return self._send(200, json.dumps(status()))
-        if u.path == "/api/peers":
-            return self._send(200, json.dumps({"peers": peers_list()}))
-        if u.path == "/api/diag":
-            script = ("sh %s/net.sh status 2>&1; echo '--- addr ---'; ip -4 addr show dev wg0 2>&1; "
-                      "echo '--- wg ---'; wg show wg0 2>&1; echo '--- routes ---'; "
-                      "ip -4 route show dev wg0 2>&1 | head -5; echo '--- net.log ---'; "
-                      "tail -15 %s/net.log 2>&1; echo '--- app.log ---'; tail -5 %s/app.log 2>&1; "
-                      "echo '--- dnsmasq ---'; tail -5 %s/dnsmasq.log 2>&1" % (DATA, DATA, DATA, DATA))
-            out = run(["/bin/sh", "-c", script], timeout=20)
-            return self._send(200, json.dumps({"diag": out}))
         if u.path == "/api/dns":
             name = (parse_qs(u.query).get("name") or [""])[0]
             if not name:
@@ -349,67 +314,66 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, json.dumps({"name": name, "a": dns_a(name)}))
             except Exception as e:
                 return self._send(200, json.dumps({"name": name, "error": str(e)}))
-        if u.path.startswith("/peers/") and u.path.endswith(".conf"):
-            name = os.path.basename(u.path)[:-5]
-            path = os.path.join(CLIENTS_DIR, name + ".conf")
-            if os.path.exists(path):
-                return self._send(200, open(path).read(), "text/plain; charset=utf-8")
-            return self._send(404, json.dumps({"error": "not found"}))
+        if u.path == "/api/diag":
+            script = ("sh %s/net.sh status 2>&1; echo '--- ovpn.log ---'; tail -14 %s/ovpn.log 2>&1; "
+                      "echo '--- net.log ---'; tail -8 %s/net.log 2>&1" % (NET_SH, DATA, DATA))
+            return self._send(200, json.dumps({"diag": sh(script, timeout=30)}))
         return self._send(404, json.dumps({"error": "not found"}))
 
     def do_POST(self):
         u = urlparse(self.path)
+        if not self._auth(u):
+            return self._send(403, json.dumps({"error": "auth"}))
         n = int(self.headers.get("Content-Length") or 0)
-        raw = self.rfile.read(n).decode("utf-8", "replace") if n else ""
-        if not self._auth(raw):
-            return self._send(403, json.dumps({"error": "forbidden"}))
+        body = self.rfile.read(n).decode("utf-8", "replace") if n else ""
+        raw = body
+        if body.startswith("conf=") or "conf=" in body[:10]:
+            body = parse_qs(body).get("conf", [""])[0]
+        q = parse_qs(u.query)
+
         if u.path == "/api/config":
-            conf = raw
-            if raw.startswith("conf=") or "conf=" in raw[:10]:
-                conf = parse_qs(raw).get("conf", [""])[0]
-            if "[Interface]" not in conf or "PrivateKey" not in conf or "[Peer]" not in conf:
-                return self._send(400, json.dumps({"error": "это не похоже на wg-конфиг"}))
-            with open(WG_CONF, "w") as f:
-                f.write(conf if conf.endswith("\n") else conf + "\n")
-            os.chmod(WG_CONF, 0o600)
-            subprocess.Popen(["/bin/sh", "-c", "sh %s/net.sh apply >> %s/net.log 2>&1" % (DATA, DATA)])
-            return self._send(200, json.dumps({"ok": True}))
-        if u.path == "/api/dns_on":
-            on = (parse_qs(raw).get("on", ["1"])[0] or "1")
-            flag = os.path.join(DATA, "dns_on")
-            if on in ("0", "off", "false"):
-                if os.path.exists(flag):
-                    os.remove(flag)
-            else:
+            if not body.strip():
+                return self._send(400, json.dumps({"error": "пустой профиль"}))
+            is_ovpn = ("<ca>" in body or "-----BEGIN CERTIFICATE-----" in body) and "remote " in body
+            if not is_ovpn and ("[Interface]" not in body or "PrivateKey" not in body):
+                return self._send(400, json.dumps({"error": "не похоже ни на .ovpn, ни на wg-конфиг"}))
+            path = OVPN_CONF if is_ovpn else WG_CONF
+            other = WG_CONF if is_ovpn else OVPN_CONF
+            with open(path, "w") as f:
+                f.write(body if body.endswith("\n") else body + "\n")
+            os.chmod(path, 0o600)
+            if os.path.exists(other):
+                os.remove(other)
+            apply_net("apply")
+            return self._send(200, json.dumps({"ok": True, "mode": mode()}))
+
+        if u.path in ("/api/dns_on", "/api/lan"):
+            on = (q.get("on") or parse_qs(raw).get("on") or ["1"])[0] not in ("0", "off", "false")
+            flag = data_path("dns_on" if u.path == "/api/dns_on" else "lan_access")
+            if on:
                 with open(flag, "w") as f:
                     f.write("1\n")
-            subprocess.Popen(["/bin/sh", "-c", "sh %s/net.sh up >> %s/net.log 2>&1" % (DATA, DATA)])
-            return self._send(200, json.dumps({"ok": True, "override": os.path.exists(flag)}))
-        if u.path == "/api/peer":
-            name = parse_qs(raw).get("name", ["phone"])[0]
-            client, err = add_peer(name)
-            if err:
-                return self._send(400, json.dumps({"error": err}))
-            return self._send(200, json.dumps({"name": name, "config": client}))
+            elif os.path.exists(flag):
+                os.remove(flag)
+            apply_net("lan" if u.path == "/api/lan" else "up")
+            return self._send(200, json.dumps({"ok": True, "on": on}))
+
+        if u.path == "/api/restart":
+            apply_net("apply")
+            return self._send(200, json.dumps({"ok": True, "status": status()}))
         return self._send(404, json.dumps({"error": "not found"}))
 
 
-def main():
-    global API_TOKEN
-    os.makedirs(DATA, exist_ok=True)
-    token_file = os.path.join(DATA, "api_token")
-    if os.path.exists(token_file):
-        API_TOKEN = open(token_file).read().strip()
-    if not API_TOKEN:
-        API_TOKEN = os.urandom(16).hex()
-        with open(token_file, "w") as f:
-            f.write(API_TOKEN)
-        os.chmod(token_file, 0o600)
-    ensure_server()
+def boot():
     threading.Thread(target=egress_loop, daemon=True).start()
-    srv = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
-    srv.serve_forever()
+    time.sleep(2)
+    apply_net("up")
+    while True:
+        time.sleep(45)
+        sh("sh %s watch >> %s/net.log 2>&1" % (NET_SH, DATA), timeout=120)
 
 
 if __name__ == "__main__":
-    main()
+    token()
+    threading.Thread(target=boot, daemon=True).start()
+    ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()

@@ -5,14 +5,21 @@ DATA=${DATA:-/data}
 RAW="https://raw.githubusercontent.com/freeeman007/umbrel-vpn/main/vpn-az/scripts"
 log() { echo "$(date -u +%FT%TZ) boot: $*" ; }
 
-mkdir -p "$DATA/www" "$DATA/wgphone/clients"
+mkdir -p "$DATA"
 
 trap 'log "сигнал остановки — снимаю перехват DNS и интерфейсы"; sh "$DATA/net.sh" down 2>/dev/null; exit 0' TERM INT
 
+# /dev/net/tun может отсутствовать до загрузки модуля tun
+if [ ! -e /dev/net/tun ]; then
+    mkdir -p /dev/net
+    mknod /dev/net/tun c 10 200 2>/dev/null && chmod 666 /dev/net/tun
+    log "создан узел /dev/net/tun"
+fi
+
 log "установка пакетов"
-apk add --no-cache wireguard-tools iptables iproute2 dnsmasq python3 curl ca-certificates musl-utils \
-    >>"$DATA/apk.log" 2>&1 || { apk update >>"$DATA/apk.log" 2>&1; \
-    apk add --no-cache wireguard-tools iptables iproute2 dnsmasq python3 curl ca-certificates musl-utils >>"$DATA/apk.log" 2>&1; }
+PKGS="openvpn wireguard-tools iptables iproute2 dnsmasq python3 curl ca-certificates musl-utils"
+apk add --no-cache $PKGS >>"$DATA/apk.log" 2>&1 || { apk update >>"$DATA/apk.log" 2>&1; \
+    apk add --no-cache $PKGS >>"$DATA/apk.log" 2>&1; }
 
 fetch() {
     for i in 1 2 3; do
@@ -34,6 +41,7 @@ APP_PID=""
 start_app() {
     [ -f "$DATA/app.py" ] || return 0
     command -v python3 >/dev/null 2>&1 || return 0
+    pkill -f "python3 -u $DATA/app.py" 2>/dev/null || true
     python3 -u "$DATA/app.py" >>"$DATA/app.log" 2>&1 &
     APP_PID=$!
     log "статус-сервер запущен (pid $APP_PID)"
@@ -61,6 +69,6 @@ while :; do
         log "статус-сервер упал, перезапуск"
         start_app
     fi
-    trim "$DATA/app.log"; trim "$DATA/dnsmasq.log"
+    trim "$DATA/app.log"; trim "$DATA/dnsmasq.log"; trim "$DATA/ovpn.log"; trim "$DATA/net.log"
     sleep 45
 done

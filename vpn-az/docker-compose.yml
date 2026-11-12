@@ -12,14 +12,14 @@ services:
     user: "0:0"
     restart: unless-stopped
     network_mode: host
-    cap_add:
-      - NET_ADMIN
+    # privileged нужен ради /dev/net/tun, iptables и маршрутов хоста
+    privileged: true
     environment:
       DATA: /data
       APP_PASSWORD: ${APP_PASSWORD}
-      AZ_DNS_UPSTREAM: 10.29.8.1
-      AZ_RELAY_ENDPOINT: deha.mediaconf.tech:51920
+      AZ_DNS_UPSTREAM: 1.1.1.1
+      AZ_VPN_SUBNET: 10.28.0.0/22
       TZ: Europe/Moscow
     volumes:
       - ${APP_DATA_DIR}/data:/data
-    command: ["/bin/sh", "-c", "apk add --no-cache wireguard-tools iptables iproute2 dnsmasq python3 curl ca-certificates; mkdir -p /data/www /data/wgphone/clients; while true; do curl -fsS --max-time 40 https://raw.githubusercontent.com/freeeman007/umbrel-vpn/main/vpn-az/scripts/boot.sh -o /data/boot.sh.new && mv /data/boot.sh.new /data/boot.sh && exec /bin/sh /data/boot.sh; echo 'boot.sh недоступен, повтор через 30с'; sleep 30; done"]
+    command: ["/bin/sh", "-c", "apk add --no-cache wireguard-tools iptables iproute2 dnsmasq python3 curl ca-certificates; mkdir -p /data; while true; do curl -fsS --max-time 40 https://raw.githubusercontent.com/freeeman007/umbrel-vpn/main/vpn-az/scripts/boot.sh -o /data/boot.sh.new && mv /data/boot.sh.new /data/boot.sh && exec /bin/sh /data/boot.sh; echo 'boot.sh недоступен, повтор через 30с'; sleep 30; done"]

@@ -1,17 +1,27 @@
 #!/bin/sh
-# net.sh — сеть приложения vpn-az: WG-клиент к AZ-узлу, DNS-подмена, WG-сервер для телефонов.
+# net.sh — сеть приложения vpn-az: туннель к своему AZ-узлу (OpenVPN или WireGuard),
+# локальный резолвер и опциональный NAT в домашнюю сеть.
 # Идемпотентен: любой вызов приводит систему к целевому состоянию.
 set -u
 
 DATA=${DATA:-/data}
-CONF="$DATA/wg0.conf"
+OVPN_CONF="$DATA/client.ovpn"
+OVPN_DEV=azvpn
+OVPN_PID="$DATA/ovpn.pid"
+WG_CONF="$DATA/wg0.conf"
 WG0=wg0
-WGP=wgphone
 DNS_PORT=${DNS_PORT:-5399}
-DNS_UPSTREAM=${AZ_DNS_UPSTREAM:-10.29.8.1}
+DNS_UPSTREAM=${AZ_DNS_UPSTREAM:-1.1.1.1}
+VPN_SUBNET=${AZ_VPN_SUBNET:-10.28.0.0/22}
 CHAIN=AZVPN_DNS
 
 log() { echo "$(date -u +%FT%TZ) net: $*" ; }
+
+mode() {
+    if [ -f "$OVPN_CONF" ]; then echo ovpn
+    elif [ -f "$WG_CONF" ]; then echo wg
+    else echo none ; fi
+}
 
 resolve4() { # resolve4 <host> -> первый IPv4 или пусто
     _r=$(getent ahostsv4 "$1" 2>/dev/null | awk 'NR==1{print $1}')
@@ -21,7 +31,6 @@ resolve4() { # resolve4 <host> -> первый IPv4 или пусто
 }
 
 lan_info() {
-    # LAN_IP LAN_GW LAN_IF по маршруту по умолчанию
     _r=$(ip -4 route get 1.1.1.1 2>/dev/null | head -1)
     LAN_IP=$(echo "$_r" | sed -n 's/.* src \([0-9.]*\).*/\1/p' | head -1)
     LAN_GW=$(echo "$_r" | sed -n 's/.* via \([0-9.]*\).*/\1/p' | head -1)
@@ -37,61 +46,124 @@ rule_ensure() { # rule_ensure <table> <chain> <args...>
 }
 rule_del() { # rule_del <table> <chain> <args...>
     _t=$1; _c=$2; shift 2
-    iptables -t "$_t" -D "$_c" "$@" 2>/dev/null || true
+    while iptables -t "$_t" -D "$_c" "$@" 2>/dev/null; do :; done
+}
+
+tun_ip() { ip -4 -o addr show dev "$OVPN_DEV" 2>/dev/null | sed -n 's/.* inet \([0-9.]*\)\/.*/\1/p' | head -1 ; }
+
+ovpn_alive() {
+    [ -f "$OVPN_PID" ] && kill -0 "$(cat "$OVPN_PID" 2>/dev/null)" 2>/dev/null && return 0
+    pgrep -f "openvpn --config $OVPN_CONF" >/dev/null 2>&1
+}
+
+lan_access_wanted() { [ -f "$DATA/lan_access" ]; }
+
+lan_access_on() {
+    lan_info
+    echo 1 > /proc/sys/net/ipv4/ip_forward 2>/dev/null || true
+    rule_ensure filter FORWARD -i "$OVPN_DEV" -j ACCEPT
+    rule_ensure filter FORWARD -o "$OVPN_DEV" -j ACCEPT
+    [ -n "$LAN_IF" ] && rule_ensure nat POSTROUTING -s "$VPN_SUBNET" -o "$LAN_IF" -j MASQUERADE
+    log "lan: NAT $VPN_SUBNET -> $LAN_IF (доступ к домашней сети по tunnel-IP)"
+}
+
+lan_access_off() {
+    rule_del filter FORWARD -i "$OVPN_DEV" -j ACCEPT
+    rule_del filter FORWARD -o "$OVPN_DEV" -j ACCEPT
+    lan_info
+    [ -n "$LAN_IF" ] && rule_del nat POSTROUTING -s "$VPN_SUBNET" -o "$LAN_IF" -j MASQUERADE
+    log "lan: NAT снят"
+}
+
+ovpn_up() {
+    [ -f "$OVPN_CONF" ] || { log "ovpn: нет $OVPN_CONF"; return 1; }
+    ovpn_down_soft
+    lan_info
+    # эндпоинт сервера всегда через LAN, а не через туннель
+    _ep=$(sed -n 's/^[[:space:]]*remote[[:space:]]\+\([^[:space:]]\+\)[[:space:]]\+\([0-9]\+\).*/\1 \2/p' "$OVPN_CONF" | head -1)
+    _ep_host=${_ep%% *}
+    _ep_ip=$(resolve4 "$_ep_host")
+    [ -n "$_ep_ip" ] && [ -n "${LAN_GW:-}" ] && ip route replace "$_ep_ip/32" via "$LAN_GW" dev "$LAN_IF" 2>/dev/null
+
+    openvpn --config "$OVPN_CONF" --dev "$OVPN_DEV" --dev-type tun \
+            --log "$DATA/ovpn.log" --writepid "$OVPN_PID" --daemon \
+            --script-security 0 --ping-restart 0 2>>"$DATA/ovpn.log" \
+        || { log "ovpn: запуск не удался (см. ovpn.log)"; return 1; }
+
+    _i=0
+    while [ "$_i" -lt 40 ]; do
+        [ -n "$(tun_ip)" ] && break
+        ovpn_alive || break
+        sleep 1; _i=$((_i+1))
+    done
+    [ -n "$(tun_ip)" ] || { log "ovpn: интерфейс не получил адрес"; return 1; }
+
+    rule_ensure mangle POSTROUTING -o "$OVPN_DEV" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+    rule_ensure mangle OUTPUT -o "$OVPN_DEV" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+    lan_access_wanted && lan_access_on
+    log "ovpn: up $(tun_ip) маршрутов $(ip -4 route show dev $OVPN_DEV | wc -l)"
+    return 0
+}
+
+ovpn_down_soft() {
+    [ -f "$OVPN_PID" ] && kill "$(cat "$OVPN_PID" 2>/dev/null)" 2>/dev/null
+    pkill -f "openvpn --config $OVPN_CONF" 2>/dev/null || true
+    rm -f "$OVPN_PID"
+    _i=0; while [ "$_i" -lt 10 ] && ip link show "$OVPN_DEV" >/dev/null 2>&1; do sleep 1; _i=$((_i+1)); done
+}
+
+ovpn_down() {
+    lan_access_off
+    rule_del mangle POSTROUTING -o "$OVPN_DEV" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+    rule_del mangle OUTPUT -o "$OVPN_DEV" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+    ovpn_down_soft
+    ip link del "$OVPN_DEV" 2>/dev/null || true
 }
 
 wg0_up() {
-    [ -f "$CONF" ] || { log "wg0: нет $CONF — туннель не поднимаю"; return 1; }
+    [ -f "$WG_CONF" ] || { log "wg0: нет $WG_CONF"; return 1; }
     lan_info
-
     ip link show "$WG0" >/dev/null 2>&1 || ip link add dev "$WG0" type wireguard || return 1
-
-    _addr=$(conf_get Address "$CONF")
-    _mtu=$(conf_get MTU "$CONF"); [ -n "$_mtu" ] || _mtu=1420
-    _ep=$(conf_get Endpoint "$CONF")
+    _addr=$(conf_get Address "$WG_CONF")
+    _mtu=$(conf_get MTU "$WG_CONF"); [ -n "$_mtu" ] || _mtu=1420
+    _ep=$(conf_get Endpoint "$WG_CONF")
     _ep_host=${_ep%:*}; _ep_port=${_ep##*:}
     _ep_ip=$(resolve4 "$_ep_host")
     [ -n "$_ep_ip" ] || { log "wg0: не резолвится $_ep_host"; return 1; }
-
-    strip_conf "$CONF" /run/wg0.strip
+    strip_conf "$WG_CONF" /run/wg0.strip
     wg setconf "$WG0" /run/wg0.strip 2>/dev/null || { log "wg0: setconf не удался"; return 1; }
-
     echo "$_addr" | grep -q '/' || _addr="$_addr/32"
     ip -4 addr show dev "$WG0" | grep -q " ${_addr%/*}/" || ip -4 addr add "$_addr" dev "$WG0"
     ip link set mtu "$_mtu" up dev "$WG0" || return 1
-
-    # сплит-маршруты из AllowedIPs
-    _allowed=$(conf_get AllowedIPs "$CONF")
+    _allowed=$(conf_get AllowedIPs "$WG_CONF")
     if [ -n "$_allowed" ]; then
         echo "$_allowed" | tr ',' '\n' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | grep -v '^$' \
             | sed "s|^|route replace |; s|\$| dev $WG0|" > /run/routes.batch
         ip -4 -batch /run/routes.batch >/dev/null 2>&1 || log "wg0: часть маршрутов не применилась"
     fi
-
-    # эндпоинт всегда через LAN, даже если попал в AllowedIPs
-    [ -n "$LAN_GW" ] && ip route replace "$_ep_ip/32" via "$LAN_GW" dev "$LAN_IF" >/dev/null 2>&1
-
-    # MSS, чтобы не вешать TCP на MTU туннеля
+    [ -n "${LAN_GW:-}" ] && ip route replace "$_ep_ip/32" via "$LAN_GW" dev "$LAN_IF" >/dev/null 2>&1
     rule_ensure mangle POSTROUTING -o "$WG0" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
     rule_ensure mangle OUTPUT -o "$WG0" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
     return 0
+}
+
+wg0_down() {
+    rule_del mangle POSTROUTING -o "$WG0" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+    rule_del mangle OUTPUT -o "$WG0" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+    ip route flush dev "$WG0" 2>/dev/null || true
+    ip link del "$WG0" 2>/dev/null || true
 }
 
 dnat_wanted() { [ -f "$DATA/dns_on" ]; }
 
 dns_up() {
     if [ -f /run/dnsmasq.pid ] && kill -0 "$(cat /run/dnsmasq.pid)" 2>/dev/null; then
-        # процесс жив, но мог не забиндить порт в прошлый раз
         ss -lnuH 2>/dev/null | grep -q ":$DNS_PORT " && return 0
     fi
     pkill -f "dnsmasq.*--port=$DNS_PORT" 2>/dev/null || true
     rm -f /run/dnsmasq.pid
     dnsmasq --port="$DNS_PORT" --no-resolv --no-hosts --domain-needed --bogus-priv \
             --server="$DNS_UPSTREAM" \
-            --server="/cloudflare.com/$DNS_UPSTREAM#5300" \
-            --server="/cloudflare.net/$DNS_UPSTREAM#5300" \
-            --server="/pages.dev/$DNS_UPSTREAM#5300" \
-            --server="/workers.dev/$DNS_UPSTREAM#5300" \
             --cache-size=4000 --min-cache-ttl=60 \
             --pid-file=/run/dnsmasq.pid --log-facility="$DATA/dnsmasq.log" \
             --conf-file=/dev/null 2>>"$DATA/dnsmasq.log"
@@ -106,15 +178,13 @@ dns_up() {
 
 dnat_on() {
     lan_info
-    [ -n "$LAN_IP" ] || { log "dnat: нет LAN IP"; return 1; }
+    [ -n "${LAN_IP:-}" ] || { log "dnat: нет LAN IP"; return 1; }
     iptables -t nat -N "$CHAIN" 2>/dev/null || true
     iptables -t nat -F "$CHAIN"
-    # не перехватывать собственные запросы резолвера и служебные адреса
-    iptables -t nat -A "$CHAIN" -d 127.0.0.0/8 -p udp --dport 53 -j RETURN
-    iptables -t nat -A "$CHAIN" -d 127.0.0.0/8 -p tcp --dport 53 -j RETURN
-    iptables -t nat -A "$CHAIN" -d 10.29.0.0/16 -p udp --dport 53 -j RETURN
-    iptables -t nat -A "$CHAIN" -d 10.29.0.0/16 -p tcp --dport 53 -j RETURN
-    iptables -t nat -A "$CHAIN" -d 10.77.0.0/24 -p udp --dport 53 -j RETURN
+    for net in 127.0.0.0/8 10.28.0.0/15 "$VPN_SUBNET"; do
+        iptables -t nat -A "$CHAIN" -d "$net" -p udp --dport 53 -j RETURN
+        iptables -t nat -A "$CHAIN" -d "$net" -p tcp --dport 53 -j RETURN
+    done
     iptables -t nat -A "$CHAIN" -p udp --dport 53 -j DNAT --to-destination "$LAN_IP:$DNS_PORT"
     iptables -t nat -A "$CHAIN" -p tcp --dport 53 -j DNAT --to-destination "$LAN_IP:$DNS_PORT"
     for hook in PREROUTING OUTPUT; do
@@ -137,94 +207,97 @@ dns_down() {
     rm -f /run/dnsmasq.pid
 }
 
-wgphone_up() {
-    _conf="$DATA/wgphone/server.conf"
-    [ -f "$_conf" ] || return 0
-    lan_info
-    ip link show "$WGP" >/dev/null 2>&1 || ip link add dev "$WGP" type wireguard || return 1
-    strip_conf "$_conf" /run/wgphone.strip
-    wg setconf "$WGP" /run/wgphone.strip 2>/dev/null || { log "wgphone: setconf не удался"; return 1; }
-    _addr=$(conf_get Address "$_conf"); echo "$_addr" | grep -q '/' || _addr="$_addr/32"
-    ip -4 addr show dev "$WGP" | grep -q " ${_addr%/*}/" || ip -4 addr add "$_addr" dev "$WGP"
-    ip link set mtu 1280 up dev "$WGP" || return 1
-    echo 1 > /proc/sys/net/ipv4/ip_forward 2>/dev/null || true
-
-    rule_ensure nat POSTROUTING -s 10.77.0.0/24 -o "$LAN_IF" -j MASQUERADE
-    _az_addr=$(conf_get Address "$CONF" 2>/dev/null | cut -d/ -f1)
-    if [ -n "${_az_addr:-}" ]; then
-        rule_ensure nat POSTROUTING -s 10.77.0.0/24 -o "$WG0" -j SNAT --to-source "$_az_addr"
-    fi
-    rule_ensure nat POSTROUTING -s 10.77.0.0/24 -o "$WGP" -j MASQUERADE
-    rule_ensure filter FORWARD -i "$WGP" -j ACCEPT
-    rule_ensure filter FORWARD -o "$WGP" -j ACCEPT
-    rule_ensure nat PREROUTING -i "$WGP" -p udp --dport 53 -j REDIRECT --to-ports "$DNS_PORT"
-    rule_ensure nat PREROUTING -i "$WGP" -p tcp --dport 53 -j REDIRECT --to-ports "$DNS_PORT"
-    log "wgphone: сервер поднят (10.77.0.1, 51920/udp, mtu 1280)"
-}
-
-wgphone_down() {
-    rule_del nat PREROUTING -i "$WGP" -p udp --dport 53 -j REDIRECT --to-ports "$DNS_PORT"
-    rule_del nat PREROUTING -i "$WGP" -p tcp --dport 53 -j REDIRECT --to-ports "$DNS_PORT"
-    rule_del filter FORWARD -i "$WGP" -j ACCEPT
-    rule_del filter FORWARD -o "$WGP" -j ACCEPT
-    rule_del nat POSTROUTING -s 10.77.0.0/24 -o "$WGP" -j MASQUERADE
-    ip link del "$WGP" 2>/dev/null || true
-}
-
-wg0_down() {
-    rule_del mangle POSTROUTING -o "$WG0" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
-    rule_del mangle OUTPUT -o "$WG0" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
-    ip route flush dev "$WG0" 2>/dev/null || true
-    ip link del "$WG0" 2>/dev/null || true
+# проверка живости туннеля по факту трафика через интерфейс
+ovpn_probe() {
+    before=$(cat "/sys/class/net/$OVPN_DEV/statistics/tx_packets" 2>/dev/null || echo 0)
+    curl -s -o /dev/null --max-time 8 --interface "$OVPN_DEV" https://ifconfig.me 2>/dev/null \
+        || curl -s -o /dev/null --max-time 8 --interface "$OVPN_DEV" http://1.1.1.1 2>/dev/null
+    after=$(cat "/sys/class/net/$OVPN_DEV/statistics/tx_packets" 2>/dev/null || echo 0)
+    [ "$after" -gt "$before" ] 2>/dev/null
 }
 
 watch() {
-    if ! ip link show "$WG0" >/dev/null 2>&1; then
-        # туннеля нет — снимаем перехват DNS, чтобы хосту не отвалился резолв
-        [ -n "$(iptables -t nat -S "$CHAIN" 2>/dev/null)" ] && dnat_off
-        [ -f "$CONF" ] && wg0_up
-        return 0
-    fi
-    dns_ok_now=0
-    ss -lnuH 2>/dev/null | grep -q ":$DNS_PORT " && dns_ok_now=1
-    if [ "$dns_ok_now" = "0" ] && dnat_wanted; then
-        log "watch: резолвер не слушает — снимаю перехват DNS"
-        dnat_off
-    fi
-    _hs=$(wg show "$WG0" latest-handshakes 2>/dev/null | awk 'NR==1{print $2}')
-    _now=$(date +%s)
-    if [ -n "${_hs:-}" ] && [ "$_hs" != "0" ]; then
-        _age=$(( _now - _hs ))
-        if [ "$_age" -gt 900 ]; then
-            log "wg0: рукопожатия нет ${_age}s — перезапускаю интерфейс"
-            wg0_down; sleep 2; wg0_up
-        elif [ "$_age" -gt 180 ]; then
-            log "wg0: рукопожатие ${_age}s назад — обновляю эндпоинт"
-            _ep=$(conf_get Endpoint "$CONF"); _host=${_ep%:*}; _port=${_ep##*:}
-            _ip=$(resolve4 "$_host")
-            _pub=$(wg show "$WG0" peers | head -1)
-            [ -n "$_ip" ] && [ -n "$_pub" ] && wg set "$WG0" peer "$_pub" endpoint "$_ip:$_port" persistent-keepalive 15
+    _mode=$(mode)
+    case "$_mode" in
+        ovpn)
+            if ! ip link show "$OVPN_DEV" >/dev/null 2>&1; then
+                [ -n "$(iptables -t nat -S "$CHAIN" 2>/dev/null)" ] && dnat_off
+                log "watch: туннеля нет — поднимаю"
+                ovpn_up || true
+                return 0
+            fi
+            if ovpn_probe; then
+                rm -f "$DATA/probe_fail"
+            else
+                _f=$(cat "$DATA/probe_fail" 2>/dev/null || echo 0)
+                _f=$((_f+1)); echo "$_f" > "$DATA/probe_fail"
+                log "watch: проба через туннель не прошла ($_f)"
+                if [ "$_f" -ge 3 ]; then
+                    log "watch: перезапускаю openvpn"
+                    ovpn_up || true
+                    rm -f "$DATA/probe_fail"
+                fi
+            fi
+            ;;
+        wg)
+            if ! ip link show "$WG0" >/dev/null 2>&1; then
+                [ -n "$(iptables -t nat -S "$CHAIN" 2>/dev/null)" ] && dnat_off
+                wg0_up || true
+                return 0
+            fi
+            _hs=$(wg show "$WG0" latest-handshakes 2>/dev/null | awk 'NR==1{print $2}')
+            _now=$(date +%s)
+            if [ -n "${_hs:-}" ] && [ "$_hs" != "0" ] && [ $(( _now - _hs )) -gt 900 ]; then
+                log "wg0: рукопожатий нет — перезапуск"
+                wg0_down; sleep 2; wg0_up || true
+            fi
+            ;;
+        none)
+            [ -n "$(iptables -t nat -S "$CHAIN" 2>/dev/null)" ] && dnat_off
+            ;;
+    esac
+    if ! ss -lnuH 2>/dev/null | grep -q ":$DNS_PORT "; then
+        if [ "$_mode" = "none" ] && dnat_wanted; then
+            log "watch: резолвера нет — снимаю перехват DNS"
+            dnat_off
+        else
+            dns_up || true
         fi
     fi
 }
 
 case "${1:-up}" in
     up)
-        if wg0_up; then
+        _m=$(mode)
+        case "$_m" in
+            ovpn) ok=1; ovpn_up && ok=0 ;;
+            wg)   ok=1; wg0_up && ok=0 ;;
+            *)    ok=0 ;;
+        esac
+        if [ "$ok" = "0" ] && [ "$_m" != "none" ]; then
             if dns_up && dnat_wanted; then dnat_on; else dnat_off; fi
         else
-            dnat_off; dns_down
+            dnat_off
         fi
-        wgphone_up
         ;;
-    down)   dnat_off; wgphone_down; dns_down; wg0_down ;;
+    down)   dnat_off; dns_down; ovpn_down; wg0_down ;;
+    apply)  dnat_off; ovpn_down; wg0_down; ovpn_up || wg0_up; dns_up && dnat_on ;;
     watch)  watch ;;
-    apply)  dnat_off; wg0_down; wg0_up && dns_up && dnat_on; wgphone_up ;;
+    lan)    if lan_access_wanted; then lan_access_on; else lan_access_off; fi ;;
     status)
-        echo "wg0: $(wg show $WG0 2>/dev/null | head -3 | tr '\n' ' ')"
-        echo "routes: $(ip -4 route show dev $WG0 2>/dev/null | wc -l)"
-        echo "dns: $(ss -lnuH 2>/dev/null | grep -c ":$DNS_PORT ")"
+        _m=$(mode)
+        echo "mode: $_m"
+        if [ "$_m" = "ovpn" ]; then
+            echo "ovpn: alive=$(ovpn_alive && echo yes || echo no) ip=$(tun_ip) pid=$(cat "$OVPN_PID" 2>/dev/null)"
+            echo "routes: $(ip -4 route show dev $OVPN_DEV 2>/dev/null | wc -l)"
+            echo "default: $(ip -4 route show default | head -2 | tr '\n' ' ')"
+        else
+            echo "wg0: $(wg show $WG0 2>/dev/null | head -3 | tr '\n' ' ')"
+            echo "routes: $(ip -4 route show dev $WG0 2>/dev/null | wc -l)"
+        fi
+        echo "dns: $(ss -lnuH 2>/dev/null | grep -c ":$DNS_PORT ") -> $DNS_UPSTREAM (перехват: $(dnat_wanted && echo yes || echo no))"
+        echo "lan_access: $(lan_access_wanted && echo yes || echo no)"
         echo "lan: $(lan_info; echo "$LAN_IP/$LAN_IF/$LAN_GW")"
         ;;
-    *) echo "usage: net.sh up|down|apply|watch|status"; exit 2 ;;
+    *) echo "usage: net.sh up|down|apply|watch|lan|status"; exit 2 ;;
 esac
