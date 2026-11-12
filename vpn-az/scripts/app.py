@@ -194,6 +194,13 @@ def genpsk():
 def ensure_server():
     os.makedirs(CLIENTS_DIR, exist_ok=True)
     if os.path.exists(PHONE_CONF) and conf_get(PHONE_CONF, "PrivateKey"):
+        # миграция порта: 51820 занят приложением WireGuard на этом же хосте
+        txt = open(PHONE_CONF).read()
+        new = re.sub(r"ListenPort\s*=\s*\d+", "ListenPort = 51920", txt)
+        if new != txt:
+            with open(PHONE_CONF, "w") as f:
+                f.write(new)
+            os.chmod(PHONE_CONF, 0o600)
         return
     priv = genkey()
     conf = ("[Interface]\nAddress = 10.77.0.1/24\nListenPort = 51920\nMTU = 1280\n"
@@ -222,10 +229,13 @@ def add_peer(name):
     with open(PHONE_CONF, "a") as f:
         f.write("\n# Client = %s\n[Peer]\nPublicKey = %s\nPresharedKey = %s\n"
                 "AllowedIPs = 10.77.0.%d/32\n" % (name, cli_pub, psk, ip))
+    # порт в профиле всегда равен фактическому ListenPort сервера
+    host = RELAY.rsplit(":", 1)[0] if ":" in RELAY else RELAY
+    port = conf_get(PHONE_CONF, "ListenPort") or "51920"
     client = ("[Interface]\nPrivateKey = %s\nAddress = 10.77.0.%d/32\n"
               "DNS = 10.77.0.1\nMTU = 1280\n\n[Peer]\nPublicKey = %s\n"
-              "PresharedKey = %s\nEndpoint = %s\nAllowedIPs = 0.0.0.0/0\n"
-              "PersistentKeepalive = 25\n" % (cli_priv, ip, srv_pub, psk, RELAY))
+              "PresharedKey = %s\nEndpoint = %s:%s\nAllowedIPs = 0.0.0.0/0\n"
+              "PersistentKeepalive = 25\n" % (cli_priv, ip, srv_pub, psk, host, port))
     os.makedirs(CLIENTS_DIR, exist_ok=True)
     with open(os.path.join(CLIENTS_DIR, name + ".conf"), "w") as f:
         f.write(client)
