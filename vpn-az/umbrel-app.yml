@@ -1,0 +1,38 @@
+manifestVersion: 1
+id: vpn-az
+category: networking
+name: AntiZapret Client
+version: "1.0.0"
+tagline: Сплит-VPN к своему VPS без зависимости от роутера
+description: >-
+  Поднимает на Umbrel постоянный WireGuard-туннель к своему узлу AntiZapret (deha)
+  с готовым сплит-конфигом: в туннель уходят только заблокированные адреса,
+  остальной трафик идёт напрямую. DNS для всех контейнеров Umbrel переводится
+  на резолвер узла, поэтому Telegram, Cloudflare и прочее открываются без
+  роутера и без правок на нём.
+
+
+  Дополнительно приложение поднимает WireGuard-сервер (порт 51820/udp),
+  через который можно заходить на Umbrel и в домашнюю сеть с любого места.
+  Точка входа — релей на VPS: пакеты приходят на публичный IP узла и
+  уходят в туннель, поэтому проброс портов на роутере не нужен.
+
+
+  Управление: карточка приложения (порт 8666) — статус туннеля, загрузка
+  wg0.conf, выдача профилей для телефона.
+developer: lii-it
+website: https://lii-it.ru
+dependencies: []
+repo: https://github.com/freeeman007/umbrel-vpn
+support: https://github.com/freeeman007/umbrel-vpn/issues
+gallery: []
+path: ""
+defaultUsername: umbrel
+deterministicPassword: true
+port: 8666
+submitter: freeeman007
+submission: https://github.com/freeeman007/umbrel-vpn
+releaseNotes: >-
+  1.0.0 — первый выпуск: WG-клиент к AZ-узлу со сплит-маршрутами,
+  локальный DNS-резолвер с подменой DNS для контейнеров Umbrel,
+  WG-сервер для внешнего доступа и статус-страница.
