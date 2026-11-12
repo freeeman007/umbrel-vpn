@@ -2,7 +2,7 @@ manifestVersion: 1
 id: vpn-az
 category: networking
 name: AntiZapret Client
-version: "1.0.0"
+version: "1.0.1"
 tagline: Сплит-VPN к своему VPS без зависимости от роутера
 description: >-
   Поднимает на Umbrel постоянный WireGuard-туннель к своему узлу AntiZapret (deha)
@@ -33,6 +33,7 @@ port: 8666
 submitter: freeeman007
 submission: https://github.com/freeeman007/umbrel-vpn
 releaseNotes: >-
+  1.0.1 — порт WG-сервера 51920 (51820 занят приложением WireGuard), переключаемый DNS-перехват.
   1.0.0 — первый выпуск: WG-клиент к AZ-узлу со сплит-маршрутами,
   локальный DNS-резолвер с подменой DNS для контейнеров Umbrel,
   WG-сервер для внешнего доступа и статус-страница.

@@ -152,7 +152,7 @@ wgphone_up() {
     rule_ensure filter FORWARD -o "$WGP" -j ACCEPT
     rule_ensure nat PREROUTING -i "$WGP" -p udp --dport 53 -j REDIRECT --to-ports "$DNS_PORT"
     rule_ensure nat PREROUTING -i "$WGP" -p tcp --dport 53 -j REDIRECT --to-ports "$DNS_PORT"
-    log "wgphone: сервер поднят (10.77.0.1, 51820/udp, mtu 1280)"
+    log "wgphone: сервер поднят (10.77.0.1, 51920/udp, mtu 1280)"
 }
 
 wgphone_down() {

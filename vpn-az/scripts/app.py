@@ -13,7 +13,7 @@ from urllib.parse import urlparse, parse_qs
 DATA = os.environ.get("DATA", "/data")
 PORT = int(os.environ.get("APP_PORT", "8666"))
 TOKEN = os.environ.get("APP_PASSWORD", "")
-RELAY = os.environ.get("AZ_RELAY_ENDPOINT", "deha.mediaconf.tech:51820")
+RELAY = os.environ.get("AZ_RELAY_ENDPOINT", "deha.mediaconf.tech:51920")
 DNS_PORT = os.environ.get("DNS_PORT", "5399")
 WG_CONF = os.path.join(DATA, "wg0.conf")
 PHONE_DIR = os.path.join(DATA, "wgphone")
@@ -196,7 +196,7 @@ def ensure_server():
     if os.path.exists(PHONE_CONF) and conf_get(PHONE_CONF, "PrivateKey"):
         return
     priv = genkey()
-    conf = ("[Interface]\nAddress = 10.77.0.1/24\nListenPort = 51820\nMTU = 1280\n"
+    conf = ("[Interface]\nAddress = 10.77.0.1/24\nListenPort = 51920\nMTU = 1280\n"
             "PrivateKey = %s\n" % priv)
     with open(PHONE_CONF, "w") as f:
         f.write(conf)

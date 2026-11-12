@@ -18,7 +18,7 @@ services:
       DATA: /data
       APP_PASSWORD: ${APP_PASSWORD}
       AZ_DNS_UPSTREAM: 10.29.8.1
-      AZ_RELAY_ENDPOINT: deha.mediaconf.tech:51820
+      AZ_RELAY_ENDPOINT: deha.mediaconf.tech:51920
       TZ: Europe/Moscow
     volumes:
       - ${APP_DATA_DIR}/data:/data
