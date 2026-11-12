@@ -109,6 +109,45 @@ def egress_loop():
         time.sleep(120)
 
 
+def dns_a(name, port=None, server="127.0.0.1"):
+    """Минимальный DNS-запрос A-записи напрямую на локальный резолвер."""
+    import socket
+    import struct
+    import random
+    port = int(port or DNS_PORT)
+    tid = random.randint(0, 65535)
+    q = struct.pack(">HHHHHH", tid, 0x0100, 1, 0, 0, 0)
+    for part in name.rstrip(".").split("."):
+        q += bytes([len(part)]) + part.encode()
+    q += b"\x00" + struct.pack(">HH", 1, 1)
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.settimeout(5)
+    try:
+        s.sendto(q, (server, port))
+        data, _ = s.recvfrom(4096)
+    finally:
+        s.close()
+    ancount = struct.unpack(">H", data[6:8])[0]
+    i = 12
+    while data[i] != 0:
+        i += 1 + data[i]
+    i += 5
+    out = []
+    for _ in range(ancount):
+        if data[i] & 0xC0 == 0xC0:
+            i += 2
+        else:
+            while data[i] != 0:
+                i += 1 + data[i]
+            i += 1
+        rtype, _rclass, _ttl, rdlen = struct.unpack(">HHIH", data[i:i + 10])
+        i += 10
+        if rtype == 1 and rdlen == 4:
+            out.append(".".join(str(b) for b in data[i:i + 4]))
+        i += rdlen
+    return out
+
+
 def status():
     st = {
         "time": int(time.time()),
@@ -116,7 +155,7 @@ def status():
         "az_address": conf_get(WG_CONF, "Address"),
         "az_endpoint": conf_get(WG_CONF, "Endpoint"),
         "routes": len(run("ip -4 route show dev wg0").splitlines()),
-        "dns": {"listening": dns_ok(), "port": DNS_PORT,
+        "dns": {"listening": dns_ok(), "port": DNS_PORT, "override": os.path.exists(os.path.join(DATA, "dns_on")),
                 "upstream": os.environ.get("AZ_DNS_UPSTREAM", "")},
         "wg0": wg_stats("wg0"),
         "wgphone": wg_stats("wgphone"),
@@ -285,6 +324,14 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, json.dumps(status()))
         if u.path == "/api/peers":
             return self._send(200, json.dumps({"peers": peers_list()}))
+        if u.path == "/api/dns":
+            name = (parse_qs(u.query).get("name") or [""])[0]
+            if not name:
+                return self._send(400, json.dumps({"error": "name?"}))
+            try:
+                return self._send(200, json.dumps({"name": name, "a": dns_a(name)}))
+            except Exception as e:
+                return self._send(200, json.dumps({"name": name, "error": str(e)}))
         if u.path.startswith("/peers/") and u.path.endswith(".conf"):
             name = os.path.basename(u.path)[:-5]
             path = os.path.join(CLIENTS_DIR, name + ".conf")
@@ -311,6 +358,18 @@ class Handler(BaseHTTPRequestHandler):
             subprocess.Popen(["/bin/sh", os.path.join(DATA, "net.sh"), "apply"],
                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             return self._send(200, json.dumps({"ok": True}))
+        if u.path == "/api/dns_on":
+            on = (parse_qs(raw).get("on", ["1"])[0] or "1")
+            flag = os.path.join(DATA, "dns_on")
+            if on in ("0", "off", "false"):
+                if os.path.exists(flag):
+                    os.remove(flag)
+            else:
+                with open(flag, "w") as f:
+                    f.write("1\n")
+            subprocess.Popen(["/bin/sh", os.path.join(DATA, "net.sh"), "up"],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            return self._send(200, json.dumps({"ok": True, "override": os.path.exists(flag)}))
         if u.path == "/api/peer":
             name = parse_qs(raw).get("name", ["phone"])[0]
             client, err = add_peer(name)

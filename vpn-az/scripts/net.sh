@@ -70,6 +70,8 @@ wg0_up() {
     return 0
 }
 
+dnat_wanted() { [ -f "$DATA/dns_on" ]; }
+
 dns_up() {
     if [ -f /run/dnsmasq.pid ] && kill -0 "$(cat /run/dnsmasq.pid)" 2>/dev/null; then
         # процесс жив, но мог не забиндить порт в прошлый раз
@@ -170,8 +172,18 @@ wg0_down() {
 }
 
 watch() {
-    [ -f "$CONF" ] || return 0
-    ip link show "$WG0" >/dev/null 2>&1 || { wg0_up; return 0; }
+    if ! ip link show "$WG0" >/dev/null 2>&1; then
+        # туннеля нет — снимаем перехват DNS, чтобы хосту не отвалился резолв
+        [ -n "$(iptables -t nat -S "$CHAIN" 2>/dev/null)" ] && dnat_off
+        [ -f "$CONF" ] && wg0_up
+        return 0
+    fi
+    dns_ok_now=0
+    ss -lnuH 2>/dev/null | grep -q ":$DNS_PORT " && dns_ok_now=1
+    if [ "$dns_ok_now" = "0" ] && dnat_wanted; then
+        log "watch: резолвер не слушает — снимаю перехват DNS"
+        dnat_off
+    fi
     _hs=$(wg show "$WG0" latest-handshakes 2>/dev/null | awk 'NR==1{print $2}')
     _now=$(date +%s)
     if [ -n "${_hs:-}" ] && [ "$_hs" != "0" ]; then
@@ -192,7 +204,7 @@ watch() {
 case "${1:-up}" in
     up)
         if wg0_up; then
-            if dns_up; then dnat_on; else dnat_off; fi
+            if dns_up && dnat_wanted; then dnat_on; else dnat_off; fi
         else
             dnat_off; dns_down
         fi
