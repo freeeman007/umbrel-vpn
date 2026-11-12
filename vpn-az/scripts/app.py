@@ -315,7 +315,8 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:
                 return self._send(200, json.dumps({"name": name, "error": str(e)}))
         if u.path == "/api/diag":
-            script = ("sh %s/net.sh status 2>&1; echo '--- ovpn.log ---'; tail -14 %s/ovpn.log 2>&1; "
+            script = ("sh %s status 2>&1; echo '--- tun ---'; ls -l /dev/net/tun 2>&1; "
+                      "echo '--- ovpn.log ---'; tail -14 %s/ovpn.log 2>&1; "
                       "echo '--- net.log ---'; tail -8 %s/net.log 2>&1" % (NET_SH, DATA, DATA))
             return self._send(200, json.dumps({"diag": sh(script, timeout=30)}))
         return self._send(404, json.dumps({"error": "not found"}))
