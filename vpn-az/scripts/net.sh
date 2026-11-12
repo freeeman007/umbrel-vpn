@@ -87,7 +87,7 @@ ovpn_up() {
 
     openvpn --config "$OVPN_CONF" --dev "$OVPN_DEV" --dev-type tun \
             --log "$DATA/ovpn.log" --writepid "$OVPN_PID" --daemon \
-            --script-security 0 --ping-restart 0 2>>"$DATA/ovpn.log" \
+            --script-security 2 --ping 10 --ping-restart 120 2>>"$DATA/ovpn.log" \
         || { log "ovpn: запуск не удался (см. ovpn.log)"; return 1; }
 
     _i=0
