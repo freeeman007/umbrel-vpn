@@ -78,7 +78,12 @@ dns_up() {
     pkill -f "dnsmasq.*--port=$DNS_PORT" 2>/dev/null || true
     rm -f /run/dnsmasq.pid
     dnsmasq --port="$DNS_PORT" --no-resolv --no-hosts --domain-needed --bogus-priv \
-            --server="$DNS_UPSTREAM" --cache-size=4000 --min-cache-ttl=60 \
+            --server="$DNS_UPSTREAM" \
+            --server="/cloudflare.com/$DNS_UPSTREAM#5300" \
+            --server="/cloudflare.net/$DNS_UPSTREAM#5300" \
+            --server="/pages.dev/$DNS_UPSTREAM#5300" \
+            --server="/workers.dev/$DNS_UPSTREAM#5300" \
+            --cache-size=4000 --min-cache-ttl=60 \
             --pid-file=/run/dnsmasq.pid --log-facility="$DATA/dnsmasq.log" \
             --conf-file=/dev/null 2>>"$DATA/dnsmasq.log"
     sleep 1
