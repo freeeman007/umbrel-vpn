@@ -240,8 +240,7 @@ def add_peer(name):
     with open(os.path.join(CLIENTS_DIR, name + ".conf"), "w") as f:
         f.write(client)
     os.chmod(os.path.join(CLIENTS_DIR, name + ".conf"), 0o600)
-    subprocess.Popen(["/bin/sh", os.path.join(DATA, "net.sh"), "up"],
-                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    subprocess.Popen(["/bin/sh", "-c", "sh %s/net.sh up >> %s/net.log 2>&1" % (DATA, DATA)])
     return client, None
 
 
@@ -334,6 +333,14 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, json.dumps(status()))
         if u.path == "/api/peers":
             return self._send(200, json.dumps({"peers": peers_list()}))
+        if u.path == "/api/diag":
+            script = ("sh %s/net.sh status 2>&1; echo '--- addr ---'; ip -4 addr show dev wg0 2>&1; "
+                      "echo '--- wg ---'; wg show wg0 2>&1; echo '--- routes ---'; "
+                      "ip -4 route show dev wg0 2>&1 | head -5; echo '--- net.log ---'; "
+                      "tail -15 %s/net.log 2>&1; echo '--- app.log ---'; tail -5 %s/app.log 2>&1; "
+                      "echo '--- dnsmasq ---'; tail -5 %s/dnsmasq.log 2>&1" % (DATA, DATA, DATA, DATA))
+            out = run(["/bin/sh", "-c", script], timeout=20)
+            return self._send(200, json.dumps({"diag": out}))
         if u.path == "/api/dns":
             name = (parse_qs(u.query).get("name") or [""])[0]
             if not name:
@@ -365,8 +372,7 @@ class Handler(BaseHTTPRequestHandler):
             with open(WG_CONF, "w") as f:
                 f.write(conf if conf.endswith("\n") else conf + "\n")
             os.chmod(WG_CONF, 0o600)
-            subprocess.Popen(["/bin/sh", os.path.join(DATA, "net.sh"), "apply"],
-                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.Popen(["/bin/sh", "-c", "sh %s/net.sh apply >> %s/net.log 2>&1" % (DATA, DATA)])
             return self._send(200, json.dumps({"ok": True}))
         if u.path == "/api/dns_on":
             on = (parse_qs(raw).get("on", ["1"])[0] or "1")
@@ -377,8 +383,7 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 with open(flag, "w") as f:
                     f.write("1\n")
-            subprocess.Popen(["/bin/sh", os.path.join(DATA, "net.sh"), "up"],
-                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.Popen(["/bin/sh", "-c", "sh %s/net.sh up >> %s/net.log 2>&1" % (DATA, DATA)])
             return self._send(200, json.dumps({"ok": True, "override": os.path.exists(flag)}))
         if u.path == "/api/peer":
             name = parse_qs(raw).get("name", ["phone"])[0]

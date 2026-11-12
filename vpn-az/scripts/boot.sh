@@ -10,9 +10,9 @@ mkdir -p "$DATA/www" "$DATA/wgphone/clients"
 trap 'log "сигнал остановки — снимаю перехват DNS и интерфейсы"; sh "$DATA/net.sh" down 2>/dev/null; exit 0' TERM INT
 
 log "установка пакетов"
-apk add --no-cache wireguard-tools iptables iproute2 dnsmasq python3 curl ca-certificates \
+apk add --no-cache wireguard-tools iptables iproute2 dnsmasq python3 curl ca-certificates musl-utils \
     >>"$DATA/apk.log" 2>&1 || { apk update >>"$DATA/apk.log" 2>&1; \
-    apk add --no-cache wireguard-tools iptables iproute2 dnsmasq python3 curl ca-certificates >>"$DATA/apk.log" 2>&1; }
+    apk add --no-cache wireguard-tools iptables iproute2 dnsmasq python3 curl ca-certificates musl-utils >>"$DATA/apk.log" 2>&1; }
 
 fetch() {
     for i in 1 2 3; do

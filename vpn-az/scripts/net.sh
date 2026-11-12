@@ -13,6 +13,13 @@ CHAIN=AZVPN_DNS
 
 log() { echo "$(date -u +%FT%TZ) net: $*" ; }
 
+resolve4() { # resolve4 <host> -> первый IPv4 или пусто
+    _r=$(getent ahostsv4 "$1" 2>/dev/null | awk 'NR==1{print $1}')
+    [ -n "$_r" ] || _r=$(busybox nslookup "$1" 2>/dev/null | awk '/^Address: /{print $2; exit}')
+    [ -n "$_r" ] || _r=$(nslookup "$1" 2>/dev/null | awk '/^Address: /{print $2; exit}')
+    printf '%s' "$_r"
+}
+
 lan_info() {
     # LAN_IP LAN_GW LAN_IF по маршруту по умолчанию
     _r=$(ip -4 route get 1.1.1.1 2>/dev/null | head -1)
@@ -43,7 +50,7 @@ wg0_up() {
     _mtu=$(conf_get MTU "$CONF"); [ -n "$_mtu" ] || _mtu=1420
     _ep=$(conf_get Endpoint "$CONF")
     _ep_host=${_ep%:*}; _ep_port=${_ep##*:}
-    _ep_ip=$(getent ahostsv4 "$_ep_host" 2>/dev/null | awk 'NR==1{print $1}')
+    _ep_ip=$(resolve4 "$_ep_host")
     [ -n "$_ep_ip" ] || { log "wg0: не резолвится $_ep_host"; return 1; }
 
     strip_conf "$CONF" /run/wg0.strip
@@ -194,7 +201,7 @@ watch() {
         elif [ "$_age" -gt 180 ]; then
             log "wg0: рукопожатие ${_age}s назад — обновляю эндпоинт"
             _ep=$(conf_get Endpoint "$CONF"); _host=${_ep%:*}; _port=${_ep##*:}
-            _ip=$(getent ahostsv4 "$_host" 2>/dev/null | awk 'NR==1{print $1}')
+            _ip=$(resolve4 "$_host")
             _pub=$(wg show "$WG0" peers | head -1)
             [ -n "$_ip" ] && [ -n "$_pub" ] && wg set "$WG0" peer "$_pub" endpoint "$_ip:$_port" persistent-keepalive 15
         fi
