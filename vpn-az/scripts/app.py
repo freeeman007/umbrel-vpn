@@ -187,7 +187,8 @@ def status():
             "alive": ovpn_alive(),
             "ip": tun_ip(),
             "routes": len(run(["ip", "-4", "route", "show", "dev", OVPN_DEV]).splitlines()),
-            "default_via_tunnel": OVPN_DEV in run(["ip", "-4", "route", "show", "default"]),
+            "default_via_tunnel": bool(re.search(r"^(0\.0\.0\.0/1|128\.0\.0\.0/1)\b",
+                                                run(["ip", "-4", "route", "show", "dev", OVPN_DEV]), re.M)),
             "meta": ovpn_meta(),
         }
     elif m == "wireguard":

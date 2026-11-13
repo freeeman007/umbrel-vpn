@@ -2,7 +2,7 @@ manifestVersion: 1
 id: vpn-az
 category: networking
 name: AntiZapret Client
-version: "2.0.0"
+version: "2.1.0"
 tagline: VPN-клиент к своему AZ-узлу, без зависимости от роутера
 description: >-
   Постоянный туннель с Umbrel к своему узлу AntiZapret (OpenVPN или WireGuard).
@@ -35,6 +35,9 @@ port: 8666
 submitter: freeeman007
 submission: https://github.com/freeeman007/umbrel-vpn
 releaseNotes: >-
+  2.1.0 — исправлен перехват DNS: резолвер работает под отдельным uid и его запросы
+  не заворачиваются в DNAT (была петля и полный отказ DNS), полный туннель
+  определяется корректно (0.0.0.0/1 + 128.0.0.0/1).
   2.0.0 — OpenVPN-клиент (профили .ovpn: полный туннель и сплит) с автоопределением
   режима, локальный DNS-резолвер с переключаемым перехватом, NAT в домашнюю сеть
   для доступа по локальным адресам, перезапуск туннеля по пробе.

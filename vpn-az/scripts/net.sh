@@ -156,14 +156,21 @@ wg0_down() {
 
 dnat_wanted() { [ -f "$DATA/dns_on" ]; }
 
+DNS_UID=1001
+
+dns_user() {
+    id -u dnsres >/dev/null 2>&1 || adduser -D -H -u "$DNS_UID" dnsres 2>/dev/null
+}
+
 dns_up() {
     if [ -f /run/dnsmasq.pid ] && kill -0 "$(cat /run/dnsmasq.pid)" 2>/dev/null; then
         ss -lnuH 2>/dev/null | grep -q ":$DNS_PORT " && return 0
     fi
     pkill -f "dnsmasq.*--port=$DNS_PORT" 2>/dev/null || true
     rm -f /run/dnsmasq.pid
+    dns_user
     dnsmasq --port="$DNS_PORT" --no-resolv --no-hosts --domain-needed --bogus-priv \
-            --server="$DNS_UPSTREAM" \
+            --server="$DNS_UPSTREAM" --user=dnsres \
             --cache-size=4000 --min-cache-ttl=60 \
             --pid-file=/run/dnsmasq.pid --log-facility="$DATA/dnsmasq.log" \
             --conf-file=/dev/null 2>>"$DATA/dnsmasq.log"
@@ -181,6 +188,8 @@ dnat_on() {
     [ -n "${LAN_IP:-}" ] || { log "dnat: нет LAN IP"; return 1; }
     iptables -t nat -N "$CHAIN" 2>/dev/null || true
     iptables -t nat -F "$CHAIN"
+    # запросы самого dnsmasq (uid dnsres) не перехватываем — иначе петля
+    iptables -t nat -A "$CHAIN" -m owner --uid-owner "$DNS_UID" -j RETURN
     for net in 127.0.0.0/8 10.28.0.0/15 "$VPN_SUBNET"; do
         iptables -t nat -A "$CHAIN" -d "$net" -p udp --dport 53 -j RETURN
         iptables -t nat -A "$CHAIN" -d "$net" -p tcp --dport 53 -j RETURN
@@ -291,6 +300,7 @@ case "${1:-up}" in
             echo "ovpn: alive=$(ovpn_alive && echo yes || echo no) ip=$(tun_ip) pid=$(cat "$OVPN_PID" 2>/dev/null)"
             echo "routes: $(ip -4 route show dev $OVPN_DEV 2>/dev/null | wc -l)"
             echo "default: $(ip -4 route show default | head -2 | tr '\n' ' ')"
+        echo "full_tunnel: $(ip -4 route show dev $OVPN_DEV 2>/dev/null | grep -cE '^(0\.0\.0\.0/1|128\.0\.0\.0/1)')"
         else
             echo "wg0: $(wg show $WG0 2>/dev/null | head -3 | tr '\n' ' ')"
             echo "routes: $(ip -4 route show dev $WG0 2>/dev/null | wc -l)"
