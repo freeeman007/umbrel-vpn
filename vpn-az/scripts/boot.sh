@@ -1,9 +1,9 @@
 #!/bin/sh
-# boot.sh — супервизор приложения vpn-az v3: пакеты, обновление скриптов, статус-сервер.
-# Туннель поднимает сам app.py (по кнопке или если был включён до перезапуска).
+# boot.sh — супервизор приложения vpn-az v3: пакеты, копия скриптов из образа, статус-сервер.
+# Код берётся из /scripts (смонтирован из каталога приложения), сеть не нужна.
 set -u
 DATA=${DATA:-/data}
-RAW="https://raw.githubusercontent.com/freeeman007/umbrel-vpn/main/vpn-az/scripts"
+SRC=${SRC:-/scripts}
 log() { echo "$(date -u +%FT%TZ) boot: $*" ; }
 
 mkdir -p "$DATA" "$DATA/profiles" "$DATA/state"
@@ -22,21 +22,19 @@ PKGS="openvpn wireguard-tools iptables iproute2 dnsmasq python3 curl ca-certific
 apk add --no-cache $PKGS >>"$DATA/apk.log" 2>&1 || { apk update >>"$DATA/apk.log" 2>&1; \
     apk add --no-cache $PKGS >>"$DATA/apk.log" 2>&1; }
 
-fetch() {
-    for i in 1 2 3; do
-        if curl -fsS --max-time 30 "$RAW/$1?v=$(date +%s)" -o "$DATA/$1.new" 2>/dev/null; then
-            mv "$DATA/$1.new" "$DATA/$1"
-            log "обновлён $1"
-            return 0
+# скрипты из каталога приложения -> рабочий каталог; старые версии остаются как резерв
+for f in net.sh app.py; do
+    if [ -f "$SRC/$f" ]; then
+        if ! cmp -s "$SRC/$f" "$DATA/$f"; then
+            cp "$SRC/$f" "$DATA/$f.new" && mv "$DATA/$f.new" "$DATA/$f" && log "обновлён $f"
         fi
-        sleep 3
-    done
-    [ -f "$DATA/$1" ] && log "не скачал $1, использую сохранённый"
-    return 1
-}
-
-fetch net.sh; chmod +x "$DATA/net.sh" 2>/dev/null
-fetch app.py
+    elif [ ! -f "$DATA/$f" ]; then
+        log "нет $f ни в $SRC, ни в $DATA — работа невозможна"
+    else
+        log "использую сохранённый $f"
+    fi
+done
+chmod +x "$DATA/net.sh" 2>/dev/null
 
 trim() {
     [ -f "$1" ] || return 0
@@ -48,7 +46,7 @@ log "старт статус-сервера"
 while :; do
     if [ -f "$DATA/app.py" ] && command -v python3 >/dev/null 2>&1; then
         python3 -u "$DATA/app.py" >>"$DATA/app.log" 2>&1
-        log "app.py завершился (код $?), перезапуск через 5 с"
+        log "app.py завершился, перезапуск через 5 с"
     else
         log "нет app.py или python3 — жду"
     fi
