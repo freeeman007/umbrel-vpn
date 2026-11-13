@@ -1,13 +1,14 @@
 #!/bin/sh
-# boot.sh — супервизор приложения vpn-az: пакеты, скачивание скриптов, туннель, статус-сервер.
+# boot.sh — супервизор приложения vpn-az v3: пакеты, обновление скриптов, статус-сервер.
+# Туннель поднимает сам app.py (по кнопке или если был включён до перезапуска).
 set -u
 DATA=${DATA:-/data}
 RAW="https://raw.githubusercontent.com/freeeman007/umbrel-vpn/main/vpn-az/scripts"
 log() { echo "$(date -u +%FT%TZ) boot: $*" ; }
 
-mkdir -p "$DATA"
+mkdir -p "$DATA" "$DATA/profiles" "$DATA/state"
 
-trap 'log "сигнал остановки — снимаю перехват DNS и интерфейсы"; sh "$DATA/net.sh" down 2>/dev/null; exit 0' TERM INT
+trap 'log "остановка — снимаю туннель и перехват DNS"; sh "$DATA/net.sh" disconnect 2>/dev/null; sh "$DATA/net.sh" dns off 2>/dev/null; exit 0' TERM INT
 
 # /dev/net/tun может отсутствовать до загрузки модуля tun
 if [ ! -e /dev/net/tun ]; then
@@ -37,38 +38,20 @@ fetch() {
 fetch net.sh; chmod +x "$DATA/net.sh" 2>/dev/null
 fetch app.py
 
-APP_PID=""
-start_app() {
-    [ -f "$DATA/app.py" ] || return 0
-    command -v python3 >/dev/null 2>&1 || return 0
-    pkill -f "python3 -u $DATA/app.py" 2>/dev/null || true
-    python3 -u "$DATA/app.py" >>"$DATA/app.log" 2>&1 &
-    APP_PID=$!
-    log "статус-сервер запущен (pid $APP_PID)"
-}
-
-trim() { # trim <файл> <байт>
+trim() {
     [ -f "$1" ] || return 0
     _sz=$(wc -c <"$1" 2>/dev/null || echo 0)
     [ "$_sz" -gt "${2:-500000}" ] && tail -c "${2:-500000}" "$1" > "$1.tmp" && mv "$1.tmp" "$1"
 }
 
-start_app
-log "старт супервизора"
-
+log "старт статус-сервера"
 while :; do
-    if [ -f "$DATA/.reload" ]; then
-        rm -f "$DATA/.reload"
-        sh "$DATA/net.sh" apply || true
+    if [ -f "$DATA/app.py" ] && command -v python3 >/dev/null 2>&1; then
+        python3 -u "$DATA/app.py" >>"$DATA/app.log" 2>&1
+        log "app.py завершился (код $?), перезапуск через 5 с"
     else
-        sh "$DATA/net.sh" up || true
-    fi
-    sh "$DATA/net.sh" watch || true
-
-    if [ -n "$APP_PID" ] && ! kill -0 "$APP_PID" 2>/dev/null; then
-        log "статус-сервер упал, перезапуск"
-        start_app
+        log "нет app.py или python3 — жду"
     fi
     trim "$DATA/app.log"; trim "$DATA/dnsmasq.log"; trim "$DATA/ovpn.log"; trim "$DATA/net.log"
-    sleep 45
+    sleep 5
 done
