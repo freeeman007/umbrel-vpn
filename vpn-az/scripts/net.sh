@@ -200,28 +200,43 @@ dns_up() {
 dnat_on() {
     lan_info
     [ -n "${LAN_IP:-}" ] || { log "dnat: нет LAN IP"; return 1; }
+    CHAIN_OUT=AZVPN_DNS_OUT
+    # общая цепочка (вставляется в PREROUTING): без owner-match, nft его там не принимает
     iptables -t nat -N "$CHAIN" 2>/dev/null || true
     iptables -t nat -F "$CHAIN"
-    # запросы самого dnsmasq (uid dnsres) не перехватываем — иначе петля
-    iptables -t nat -A "$CHAIN" -m owner --uid-owner "$DNS_UID" -j RETURN
     for net in 127.0.0.0/8 10.28.0.0/15 "$VPN_SUBNET"; do
         iptables -t nat -A "$CHAIN" -d "$net" -p udp --dport 53 -j RETURN
         iptables -t nat -A "$CHAIN" -d "$net" -p tcp --dport 53 -j RETURN
     done
     iptables -t nat -A "$CHAIN" -p udp --dport 53 -j DNAT --to-destination "$LAN_IP:$DNS_PORT"
     iptables -t nat -A "$CHAIN" -p tcp --dport 53 -j DNAT --to-destination "$LAN_IP:$DNS_PORT"
-    for hook in PREROUTING OUTPUT; do
-        iptables -t nat -C "$hook" -j "$CHAIN" 2>/dev/null || iptables -t nat -I "$hook" 1 -j "$CHAIN"
-    done
-    log "dnat: DNS всех контейнеров -> $LAN_IP:$DNS_PORT"
+
+    # отдельная цепочка для OUTPUT: первым правилом выпускаем запросы самого резолвера
+    iptables -t nat -N "$CHAIN_OUT" 2>/dev/null || true
+    iptables -t nat -F "$CHAIN_OUT"
+    iptables -t nat -A "$CHAIN_OUT" -m owner --uid-owner "$DNS_UID" -j RETURN
+    iptables -t nat -A "$CHAIN_OUT" -j "$CHAIN"
+
+    iptables -t nat -C PREROUTING -j "$CHAIN" 2>/dev/null || iptables -t nat -I PREROUTING 1 -j "$CHAIN"
+    iptables -t nat -C OUTPUT -j "$CHAIN_OUT" 2>/dev/null || iptables -t nat -I OUTPUT 1 -j "$CHAIN_OUT"
+    if iptables -t nat -S PREROUTING | grep -q "$CHAIN"; then
+        log "dnat: DNS всех контейнеров -> $LAN_IP:$DNS_PORT"
+    else
+        log "dnat: НЕ удалось вставить правило перехвата"
+        return 1
+    fi
 }
 
 dnat_off() {
     for hook in PREROUTING OUTPUT; do
-        while iptables -t nat -C "$hook" -j "$CHAIN" 2>/dev/null; do iptables -t nat -D "$hook" -j "$CHAIN"; done
+        for ch in "$CHAIN" AZVPN_DNS_OUT; do
+            while iptables -t nat -C "$hook" -j "$ch" 2>/dev/null; do iptables -t nat -D "$hook" -j "$ch"; done
+        done
     done
-    iptables -t nat -F "$CHAIN" 2>/dev/null || true
-    iptables -t nat -X "$CHAIN" 2>/dev/null || true
+    for ch in "$CHAIN" AZVPN_DNS_OUT; do
+        iptables -t nat -F "$ch" 2>/dev/null || true
+        iptables -t nat -X "$ch" 2>/dev/null || true
+    done
     log "dnat: снят"
 }
 
@@ -232,11 +247,10 @@ dns_down() {
 
 # проверка живости туннеля по факту трафика через интерфейс
 ovpn_probe() {
-    before=$(cat "/sys/class/net/$OVPN_DEV/statistics/tx_packets" 2>/dev/null || echo 0)
-    curl -s -o /dev/null --max-time 8 --interface "$OVPN_DEV" https://ifconfig.me 2>/dev/null \
-        || curl -s -o /dev/null --max-time 8 --interface "$OVPN_DEV" http://1.1.1.1 2>/dev/null
-    after=$(cat "/sys/class/net/$OVPN_DEV/statistics/tx_packets" 2>/dev/null || echo 0)
-    [ "$after" -gt "$before" ] 2>/dev/null
+    # только IP-адреса: резолв имени зависит от DNS, а DNS идёт через тот же
+    # туннель — проба по имени давала ложные падения и перезапуски openvpn
+    ping -I "$OVPN_DEV" -c1 -W3 1.1.1.1 >/dev/null 2>&1 && return 0
+    curl -s -o /dev/null --max-time 8 --interface "$OVPN_DEV" https://1.1.1.1/ 2>/dev/null
 }
 
 watch() {
