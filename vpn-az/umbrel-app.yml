@@ -2,7 +2,7 @@ manifestVersion: 1
 id: vpn-az
 category: networking
 name: VPN AZ
-version: "3.0.3"
+version: "3.0.4"
 tagline: VPN-клиент с библиотекой профилей и включением в один тап
 description: >-
   Клиент к своему VPN-серверу прямо на Umbrel: библиотека профилей
@@ -37,6 +37,8 @@ port: 8666
 submitter: freeeman007
 submission: https://github.com/freeeman007/umbrel-vpn
 releaseNotes: >-
+  3.0.4 — доставка скриптов с двух зеркал (raw.githubusercontent, jsDelivr) с проверкой размера;
+  запуск приложения больше не зависит от одного CDN.
   3.0.3 — код приложения едет внутри приложения (том /scripts), без скачивания с GitHub:
   раньше при обновлении подхватывалась устаревшая копия из CDN.
   3.0.2 — полный туннель определяется по факту (default-маршрут ушёл в tun), а не по тексту конфига:

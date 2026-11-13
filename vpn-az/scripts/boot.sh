@@ -1,10 +1,12 @@
 #!/bin/sh
-# boot.sh — супервизор приложения vpn-az v3: пакеты, копия скриптов из образа, статус-сервер.
-# Код берётся из /scripts (смонтирован из каталога приложения), сеть не нужна.
+# boot.sh — супервизор приложения vpn-az v3: пакеты, доставка скриптов, статус-сервер.
+# Скрипты тянутся с двух зеркал; в /data всегда лежит последняя рабочая копия.
 set -u
 DATA=${DATA:-/data}
-SRC=${SRC:-/scripts}
 log() { echo "$(date -u +%FT%TZ) boot: $*" ; }
+
+MIRRORS="https://raw.githubusercontent.com/freeeman007/umbrel-vpn/main/vpn-az/scripts
+https://cdn.jsdelivr.net/gh/freeeman007/umbrel-vpn@main/vpn-az/scripts"
 
 mkdir -p "$DATA" "$DATA/profiles" "$DATA/state"
 
@@ -22,18 +24,27 @@ PKGS="openvpn wireguard-tools iptables iproute2 dnsmasq python3 curl ca-certific
 apk add --no-cache $PKGS >>"$DATA/apk.log" 2>&1 || { apk update >>"$DATA/apk.log" 2>&1; \
     apk add --no-cache $PKGS >>"$DATA/apk.log" 2>&1; }
 
-# скрипты из каталога приложения -> рабочий каталог; старые версии остаются как резерв
-for f in net.sh app.py; do
-    if [ -f "$SRC/$f" ]; then
-        if ! cmp -s "$SRC/$f" "$DATA/$f"; then
-            cp "$SRC/$f" "$DATA/$f.new" && mv "$DATA/$f.new" "$DATA/$f" && log "обновлён $f"
+# fetch <имя> <минимальный размер> — скачать с зеркал, сохранить рабочую копию
+fetch() {
+    _name=$1; _min=$2
+    for _m in $MIRRORS; do
+        if curl -fsS --max-time 25 "$_m/$_name?v=$(date +%s)" -o "$DATA/$_name.new" 2>/dev/null; then
+            _sz=$(wc -c <"$DATA/$_name.new" 2>/dev/null || echo 0)
+            if [ "$_sz" -ge "$_min" ]; then
+                mv "$DATA/$_name.new" "$DATA/$_name"
+                log "обновлён $_name ($_sz байт)"
+                return 0
+            fi
+            log "битая копия $_name ($_sz байт), пробую другое зеркало"
+            rm -f "$DATA/$_name.new"
         fi
-    elif [ ! -f "$DATA/$f" ]; then
-        log "нет $f ни в $SRC, ни в $DATA — работа невозможна"
-    else
-        log "использую сохранённый $f"
-    fi
-done
+    done
+    [ -f "$DATA/$_name" ] && log "не скачал $_name, использую сохранённый"
+    return 1
+}
+
+fetch net.sh 8000
+fetch app.py 20000
 chmod +x "$DATA/net.sh" 2>/dev/null
 
 trim() {
