@@ -19,7 +19,7 @@ import zlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
-VERSION = "3.0.5"
+VERSION = "3.0.6"
 DATA = os.environ.get("DATA", "/data")
 PORT = int(os.environ.get("APP_PORT", "8666"))
 NET_SH = os.path.join(DATA, "net.sh")
@@ -419,6 +419,26 @@ def probe_direct():
         if code in ("200", "301", "302", "403", "404"):
             return True
     return False
+
+
+def check_url(url, via=""):
+    """Проверка сайта с сервера: via=tunnel — принудительно через интерфейс туннеля."""
+    if not re.match(r"^https?://[^\s]+$", url or ""):
+        return {"ok": False, "error": "нужен адрес вида https://site"}
+    cmd = ["curl", "-sS", "-o", "/dev/null", "-m", "15", "-k",
+           "-w", "%{http_code} %{time_total} %{remote_ip}"]
+    if via == "tunnel":
+        dev = tun_dev()
+        if not dev:
+            return {"ok": False, "error": "туннель не поднят"}
+        cmd += ["--interface", dev]
+    out = run(cmd + [url], timeout=25)
+    parts = (out or "").split()
+    if len(parts) < 3 or not parts[0].isdigit():
+        return {"ok": False, "via": via or "direct", "error": (out or "нет ответа")[:200]}
+    code = int(parts[0])
+    return {"ok": code < 400, "via": via or "direct", "code": code,
+            "time": round(float(parts[1]), 2), "ip": parts[2]}
 
 
 def do_connect(pid):
@@ -837,8 +857,13 @@ class Handler(BaseHTTPRequestHandler):
             script = ("sh %s status 2>&1; echo '--- tun ---'; ls -l /dev/net/tun 2>&1; "
                       "echo '--- ovpn.log ---'; tail -16 %s/ovpn.log 2>&1; "
                       "echo '--- net.log ---'; tail -10 %s/net.log 2>&1; "
-                      "echo '--- ip route ---'; ip -4 route 2>&1 | head -20" % (NET_SH, DATA, DATA))
+                      "echo '--- ip route ---'; ip -4 route 2>&1 | head -80" % (NET_SH, DATA, DATA))
             return self._send(200, json.dumps({"diag": sh(script, timeout=40)}, ensure_ascii=False))
+        if u.path == "/api/check":
+            q = parse_qs(u.query)
+            url = (q.get("url") or [""])[0]
+            via = (q.get("via") or [""])[0]
+            return self._send(200, json.dumps(check_url(url, via), ensure_ascii=False))
         return self._send(404, json.dumps({"error": "not found"}))
 
     def do_POST(self):

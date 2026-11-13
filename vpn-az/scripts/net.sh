@@ -280,9 +280,18 @@ lan_access_off() {
 tun_dev() { if ip link show "$OVPN_DEV" >/dev/null 2>&1; then echo "$OVPN_DEV"; \
             elif ip link show "$WG0" >/dev/null 2>&1; then echo "$WG0"; fi ; }
 
-# связь через туннель по IP, без DNS (DNS может идти по туннелю и врать)
+# шлюз туннеля (via-адрес любого маршрута в tun)
+tun_gw() {
+    _d=$(tun_dev); [ -n "$_d" ] || return 1
+    ip -4 route show dev "$_d" 2>/dev/null | awk '/ via /{print $3; exit}'
+}
+
+# связь через туннель по IP, без DNS (DNS может идти по туннелю и врать).
+# Сначала пинг шлюза туннеля — он отвечает и в сплит-режиме, где 1.1.1.1 в туннель не маршрутизируется.
 probe_tunnel() {
     _dev=$(tun_dev); [ -n "$_dev" ] || return 1
+    _gw=$(tun_gw)
+    [ -n "$_gw" ] && ping -I "$_dev" -c1 -W3 "$_gw" >/dev/null 2>&1 && return 0
     for _u in http://1.1.1.1/ https://1.1.1.1/; do
         _code=$(curl -s -o /dev/null -m 8 --interface "$_dev" -w '%{http_code}' "$_u" 2>/dev/null)
         case "$_code" in 200|301|302|403|404) return 0 ;; esac
