@@ -31,10 +31,20 @@ resolve4() { # resolve4 <host> -> первый IPv4 или пусто
 }
 
 lan_info() {
-    _r=$(ip -4 route get 1.1.1.1 2>/dev/null | head -1)
-    LAN_IP=$(echo "$_r" | sed -n 's/.* src \([0-9.]*\).*/\1/p' | head -1)
-    LAN_GW=$(echo "$_r" | sed -n 's/.* via \([0-9.]*\).*/\1/p' | head -1)
-    LAN_IF=$(echo "$_r" | sed -n 's/.* dev \([^ ]*\).*/\1/p' | head -1)
+    # домашний интерфейс ищем по адресу, а не по default: при полном туннеле
+    # default уже смотрит в azvpn/wg0 и даёт неверный интерфейс для NAT
+    LAN_IP=""; LAN_IF=""; LAN_GW=""
+    for _n in /sys/class/net/*; do
+        _i=$(basename "$_n")
+        case "$_i" in lo|azvpn|wg0|tun*|tap*|docker*|veth*|br-*|virbr*) continue ;;
+        esac
+        _a=$(ip -4 -o addr show dev "$_i" 2>/dev/null | sed -n 's/.* inet \([0-9.]*\)\/.*/\1/p' | head -1)
+        [ -n "$_a" ] || continue
+        case "$_a" in 10.28.*|10.29.*) continue ;; esac
+        LAN_IP=$_a; LAN_IF=$_i; break
+    done
+    [ -n "$LAN_IF" ] && LAN_GW=$(ip -4 route show dev "$LAN_IF" 2>/dev/null \
+        | sed -n 's/^default via \([0-9.]*\).*/\1/p' | head -1)
 }
 
 strip_conf() { grep -vE '^[[:space:]]*(Address|DNS|MTU)[[:space:]]*=' "$1" > "$2" ; }
