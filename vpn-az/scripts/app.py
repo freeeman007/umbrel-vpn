@@ -19,6 +19,7 @@ import zlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
+VERSION = "3.0.1"
 DATA = os.environ.get("DATA", "/data")
 PORT = int(os.environ.get("APP_PORT", "8666"))
 NET_SH = os.path.join(DATA, "net.sh")
@@ -383,6 +384,7 @@ def status():
     prof = profile(aid) if aid else None
     dev = tun_dev()
     st = {
+        "version": VERSION,
         "time": int(time.time()),
         "phase": ph,
         "error": state("error"),
