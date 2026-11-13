@@ -5,8 +5,11 @@ set -u
 DATA=${DATA:-/data}
 log() { echo "$(date -u +%FT%TZ) boot: $*" ; }
 
-MIRRORS="https://raw.githubusercontent.com/freeeman007/umbrel-vpn/main/vpn-az/scripts
-https://cdn.jsdelivr.net/gh/freeeman007/umbrel-vpn@main/vpn-az/scripts"
+# зеркала: сначала тег релиза в jsDelivr (кэш тегов иммутабельный, поэтому не бывает
+# устаревших скриптов), затем raw.githubusercontent как запас. @main не использовать:
+# jsDelivr держит кэш ветки часами и app.py приезжает старый.
+MIRRORS="https://cdn.jsdelivr.net/gh/freeeman007/umbrel-vpn@v3.0.6/vpn-az/scripts
+https://raw.githubusercontent.com/freeeman007/umbrel-vpn/main/vpn-az/scripts"
 
 mkdir -p "$DATA" "$DATA/profiles" "$DATA/state"
 
