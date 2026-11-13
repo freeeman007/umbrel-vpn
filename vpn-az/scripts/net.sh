@@ -263,17 +263,18 @@ watch() {
                 ovpn_up || true
                 return 0
             fi
+            if ! ovpn_alive; then
+                log "watch: процесс openvpn умер — поднимаю"
+                ovpn_up || true
+                return 0
+            fi
+            # пробу пишем в лог, но не перезапускаем: реконнект делает сам openvpn
             if ovpn_probe; then
                 rm -f "$DATA/probe_fail"
             else
                 _f=$(cat "$DATA/probe_fail" 2>/dev/null || echo 0)
-                _f=$((_f+1)); echo "$_f" > "$DATA/probe_fail"
-                log "watch: проба через туннель не прошла ($_f)"
-                if [ "$_f" -ge 3 ]; then
-                    log "watch: перезапускаю openvpn"
-                    ovpn_up || true
-                    rm -f "$DATA/probe_fail"
-                fi
+                echo $((_f+1)) > "$DATA/probe_fail"
+                log "watch: проба через туннель не прошла ($((_f+1)))"
             fi
             ;;
         wg)
@@ -307,8 +308,10 @@ case "${1:-up}" in
     up)
         _m=$(mode)
         case "$_m" in
-            ovpn) ok=1; ovpn_up && ok=0 ;;
-            wg)   ok=1; wg0_up && ok=0 ;;
+            ovpn)
+                if ovpn_alive && [ -n "$(tun_ip)" ]; then ok=0; else ok=1; ovpn_up && ok=0; fi ;;
+            wg)
+                if ip link show "$WG0" >/dev/null 2>&1; then ok=0; else ok=1; wg0_up && ok=0; fi ;;
             *)    ok=0 ;;
         esac
         if [ "$ok" = "0" ] && [ "$_m" != "none" ]; then

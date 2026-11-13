@@ -2,7 +2,7 @@ manifestVersion: 1
 id: vpn-az
 category: networking
 name: AntiZapret Client
-version: "2.1.3"
+version: "2.1.4"
 tagline: VPN-клиент к своему AZ-узлу, без зависимости от роутера
 description: >-
   Постоянный туннель с Umbrel к своему узлу AntiZapret (OpenVPN или WireGuard).
@@ -35,6 +35,8 @@ port: 8666
 submitter: freeeman007
 submission: https://github.com/freeeman007/umbrel-vpn
 releaseNotes: >-
+  2.1.4 — `up` больше не перезапускает живой туннель (перезапуск каждые 45 с и был
+  причиной «сеть падает»), проба не влияет на перезапуск — реконнект делает сам openvpn.
   2.1.3 — перехват DNS через две цепочки (owner-match только в OUTPUT, иначе nft
   отклоняет правило в PREROUTING), проба живости туннеля по IP без DNS
   (раньше ложные падения перезапускали openvpn каждые две минуты).
