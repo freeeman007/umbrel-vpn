@@ -408,8 +408,11 @@ def status():
 
 
 def probe_direct():
-    code = run("curl -s -o /dev/null -m 5 -w '%%{http_code}' http://1.1.1.1/")
-    return code in ("200", "301", "302", "403", "404")
+    for url in ("http://1.1.1.1/", "https://1.1.1.1/"):
+        code = run(["curl", "-s", "-o", "/dev/null", "-m", "5", "-w", "%{http_code}", url])
+        if code in ("200", "301", "302", "403", "404"):
+            return True
+    return False
 
 
 def do_connect(pid):

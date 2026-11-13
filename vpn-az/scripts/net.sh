@@ -283,8 +283,10 @@ tun_dev() { if ip link show "$OVPN_DEV" >/dev/null 2>&1; then echo "$OVPN_DEV"; 
 # связь через туннель по IP, без DNS (DNS может идти по туннелю и врать)
 probe_tunnel() {
     _dev=$(tun_dev); [ -n "$_dev" ] || return 1
-    _code=$(curl -s -o /dev/null -m 8 --interface "$_dev" -w '%{http_code}' http://1.1.1.1/ 2>/dev/null)
-    case "$_code" in 200|301|302|403|404) return 0 ;; esac
+    for _u in http://1.1.1.1/ https://1.1.1.1/; do
+        _code=$(curl -s -o /dev/null -m 8 --interface "$_dev" -w '%{http_code}' "$_u" 2>/dev/null)
+        case "$_code" in 200|301|302|403|404) return 0 ;; esac
+    done
     ping -I "$_dev" -c1 -W3 1.1.1.1 >/dev/null 2>&1 && return 0
     return 1
 }
