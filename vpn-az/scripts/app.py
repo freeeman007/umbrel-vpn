@@ -19,7 +19,7 @@ import zlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
-VERSION = "3.0.1"
+VERSION = "3.0.2"
 DATA = os.environ.get("DATA", "/data")
 PORT = int(os.environ.get("APP_PORT", "8666"))
 NET_SH = os.path.join(DATA, "net.sh")
@@ -718,7 +718,7 @@ function render(){
   if(!list.length){ box.innerHTML='<div class="card" style="color:#7d8698;font-size:13px">Профилей нет. Добавь .ovpn или .conf.</div>'; return; }
   box.innerHTML=list.map(function(x){
     const sel=x.id===S.active_id;
-    const meta=(x.type==='openvpn'?'OpenVPN':'WireGuard')+(x.full_tunnel?' · весь трафик':' · сплит')+
+    const meta=(x.type==='openvpn'?'OpenVPN':'WireGuard')+(x.full_tunnel?' · весь трафик':'' )+
       (x.remotes&&x.remotes.length?' · '+x.remotes[0]:'')+(x.missing&&x.missing.length?' · нет файлов: '+x.missing.join(','):'');
     return '<div class="prof'+(sel?' sel':'')+'" onclick="pick(\\''+x.id+'\\')">'+
       '<span class="dot"></span><div style="min-width:0"><div class="pname">'+esc(x.name)+'</div>'+

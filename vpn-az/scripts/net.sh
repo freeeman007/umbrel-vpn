@@ -291,6 +291,13 @@ probe_tunnel() {
     return 1
 }
 
+# полный туннель определяем по факту (default ушёл в tun), а не только по конфигу:
+# сервер может пушить redirect-gateway, которого в .ovpn нет
+tunnel_is_default() {
+    _d=$(tun_dev); [ -n "$_d" ] || return 1
+    ip -4 route show dev "$_d" 2>/dev/null | grep -qE '^(default|0\.0\.0\.0/1|128\.0\.0\.0/1)( |$)'
+}
+
 # есть ли вообще выход в интернет напрямую (страховка: туннель мог убить сеть)
 probe_direct() {
     _code=$(curl -s -o /dev/null -m 6 -w '%{http_code}' http://1.1.1.1/ 2>/dev/null)
@@ -325,11 +332,10 @@ connect() {
     lan_access_wanted && lan_access_on
 
     # ждём, пока трафик реально пойдёт через туннель; иначе откат
-    if full_tunnel "$_id"; then
+    if tunnel_is_default; then
         _i=0
         while [ "$_i" -lt "$PROBE_TIMEOUT" ]; do
             probe_tunnel && break
-            ovpn_alive "$_id" >/dev/null 2>&1 || { [ "$_type" = wg ] && ip link show "$WG0" >/dev/null 2>&1 ; } || true
             sleep 5; _i=$((_i+5))
         done
         if [ "$_i" -ge "$PROBE_TIMEOUT" ]; then
@@ -340,6 +346,17 @@ connect() {
             probe_direct || log "откат: прямой сети тоже нет!"
             return 1
         fi
+    else
+        log "connect[$_id]: сплит-режим (default не через туннель), автооткат по пробе не нужен"
+    fi
+
+    # даже в сплит-режиме: если сеть пропала совсем — откат
+    if ! probe_direct && ! probe_tunnel; then
+        log "connect[$_id]: после поднятия нет ни прямого выхода, ни туннеля — откат"
+        stop_tunnel
+        set_error "после подключения пропала связь — туннель выключен автоматически"
+        set_phase failed
+        return 1
     fi
 
     set_since "$(date +%s)"
@@ -367,7 +384,7 @@ watch() {
                         if ! ovpn_alive "$_id"; then
                             log "watch: openvpn умер — переподключаю"
                             connect "$_id" || true
-                        elif full_tunnel "$_id" && ! probe_tunnel; then
+                        elif tunnel_is_default && ! probe_tunnel; then
                             _f=$(cat "$STATE/probe_fail" 2>/dev/null || echo 0)
                             _f=$((_f+1)); echo "$_f" > "$STATE/probe_fail"
                             log "watch: проба через туннель не прошла ($_f)"
