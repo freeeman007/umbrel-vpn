@@ -19,7 +19,7 @@ import zlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
-VERSION = "3.0.4"
+VERSION = "3.0.5"
 DATA = os.environ.get("DATA", "/data")
 PORT = int(os.environ.get("APP_PORT", "8666"))
 NET_SH = os.path.join(DATA, "net.sh")
@@ -358,7 +358,11 @@ def default_via_tunnel():
 
 
 def dns_listening():
-    return bool(run("ss -lnuH | grep -q ':%s '" % DNS_PORT))
+    out = run("ss -lnuH 2>/dev/null | grep -c ':%s '" % DNS_PORT)
+    try:
+        return int((out or "0").strip() or 0) > 0
+    except ValueError:
+        return False
 
 
 def egress_loop():
