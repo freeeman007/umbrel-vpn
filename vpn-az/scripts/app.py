@@ -19,7 +19,7 @@ import zlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
-VERSION = "3.0.6"
+VERSION = "3.0.7"
 DATA = os.environ.get("DATA", "/data")
 PORT = int(os.environ.get("APP_PORT", "8666"))
 NET_SH = os.path.join(DATA, "net.sh")
@@ -425,7 +425,8 @@ def check_url(url, via=""):
     """Проверка сайта с сервера: via=tunnel — принудительно через интерфейс туннеля."""
     if not re.match(r"^https?://[^\s]+$", url or ""):
         return {"ok": False, "error": "нужен адрес вида https://site"}
-    cmd = ["curl", "-sS", "-o", "/dev/null", "-m", "15", "-k",
+    # -4: туннель IPv4-only, иначе curl уходит в AAAA и падает мгновенно
+    cmd = ["curl", "-sS", "-4", "-o", "/dev/null", "-m", "15", "-k",
            "-w", "%{http_code} %{time_total} %{remote_ip}"]
     if via == "tunnel":
         dev = tun_dev()
