@@ -117,9 +117,13 @@ ovpn_up() {
 
 ovpn_down_soft() {
     [ -f "$OVPN_PID" ] && kill "$(cat "$OVPN_PID" 2>/dev/null)" 2>/dev/null
+    # убиваем все наши процессы openvpn: при duplicate-cn на сервере вторая
+    # сессия с тем же CN/адресом ломает маршрутизацию
     pkill -f "openvpn --config $OVPN_CONF" 2>/dev/null || true
+    pkill -f "openvpn.*--dev $OVPN_DEV" 2>/dev/null || true
     rm -f "$OVPN_PID"
     _i=0; while [ "$_i" -lt 10 ] && ip link show "$OVPN_DEV" >/dev/null 2>&1; do sleep 1; _i=$((_i+1)); done
+    ip link del "$OVPN_DEV" 2>/dev/null || true
 }
 
 ovpn_down() {
