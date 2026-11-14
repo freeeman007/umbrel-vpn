@@ -20,7 +20,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import urllib.request
 from urllib.parse import urlparse, parse_qs
 
-VERSION = "3.7.6"
+VERSION = "3.7.7"
 DATA = os.environ.get("DATA", "/data")
 PORT = int(os.environ.get("APP_PORT", "8666"))
 NET_SH = os.path.join(DATA, "net.sh")
@@ -539,6 +539,7 @@ def status():
             "dev": dev,
             "ip": tun_ip() if dev else "",
             "routes": routes_count(),
+            "routes_list": dev_routes(dev) if dev else [],
             "default_via_tunnel": default_via_tunnel(),
             "alive": bool(dev),
             "peers": wg_peers() if dev == "wg0" else [],
@@ -1120,11 +1121,11 @@ transition:opacity .13s ease,transform .13s ease,visibility .13s}
 уходят только его сети (корпоративная и т.п.), интернет идёт как обычно — через основной VPN,
 если он включён, иначе напрямую. Доп. туннели работают и при выключенном основном.</div>
 
-<div class="sec">Доп. туннели</div>
+<div class="sec">Маршруты туннелей</div>
 <div class="card">
-  <div id="auxrows"></div>
-  <div class="hint" id="auxempty">Не подключены. Нажми «+» на карточке профиля — доп. туннели
-  работают и без основного VPN, интернет при этом остаётся как есть.</div>
+  <div id="tunrows"></div>
+  <div class="hint" id="tunempty">Туннелей нет. Включи основной профиль или нажми «+» на карточке,
+  чтобы поднять его как дополнительный.</div>
 </div>
 
 <div class="sec">Сервис</div>
@@ -1327,23 +1328,37 @@ function render(){
   renderAux();
 }
 
-// ---- статус дополнительных туннелей
+// ---- маршруты туннелей: основной и дополнительные в одном списке
+function tunNets(routes){
+  const nets=(routes||[]).map(function(r){return String(r).split(' ')[0];}).filter(function(x){
+    return x && x.indexOf(':')<0 && x.indexOf('172.')!==0 && x.indexOf('10.28.')!==0 && x.indexOf('10.29.')!==0;
+  });
+  return nets.length ? esc(nets.slice(0,6).join(', '))+(nets.length>6?' …':'') : '';
+}
 function renderAux(){
-  const box=document.getElementById('auxrows'), empty=document.getElementById('auxempty');
-  const arr=(S&&S.aux)||[];
+  const box=document.getElementById('tunrows'), empty=document.getElementById('tunempty');
+  if(!box||!empty) return;
+  const arr=[];
+  if(S && S.phase==='on' && S.tunnel && S.tunnel.dev){
+    arr.push({id:'__main', name:((S.active&&S.active.name)||'основной'), dev:S.tunnel.dev,
+              ip:S.tunnel.ip, routes:S.tunnel.routes_list||[], up:true, main:true});
+  }
+  ((S&&S.aux)||[]).forEach(function(a){ arr.push({id:a.id,name:a.name,dev:a.dev,ip:a.ip,
+    routes:a.routes,up:a.up,main:false}); });
   box.innerHTML='';
   empty.style.display=arr.length?'none':'block';
   arr.forEach(function(a){
     const d=document.createElement('div'); d.className='arow';
     const st=a.up?'<span class="badge ok">поднят</span>':'<span class="badge bad">не поднят</span>';
-    const nets=(a.routes||[]).map(function(r){return String(r).split(' ')[0];})
-      .filter(function(x){return x&&x.indexOf(':')<0 && x.indexOf('172.')!==0 && x.indexOf('10.28.')!==0;});
-    d.innerHTML='<div class="an"><b>'+esc(a.name||a.id)+'</b><div class="ad">'+esc(a.dev||'')+
-      (a.ip?(' · '+esc(a.ip)):'')+' · '+((a.routes||[]).length)+' маршр.'+
-      (nets.length?'<br>'+esc(nets.slice(0,6).join(', '))+(nets.length>6?' …':''):'')+
-      '</div></div>'+st+
-      '<button class="ico" title="Отключить доп. туннель">✕</button>';
-    d.querySelector('button').addEventListener('click',function(){
+    const kind=a.main?'<span class="badge" style="background:#16301f;color:#5fdc94">основной</span>'
+                     :'<span class="badge" style="background:#12283a;color:#6fb2e0">доп.</span>';
+    const nets=tunNets(a.routes);
+    d.innerHTML='<div class="an"><b>'+esc(a.name||a.id)+'</b> '+kind+
+      '<div class="ad">'+esc(a.dev||'')+(a.ip?(' · '+esc(a.ip)):'')+
+      ' · '+((a.routes||[]).length)+' маршр.'+(nets?'<br>'+nets:'')+'</div></div>'+st+
+      (a.main?'':'<button class="ico" title="Отключить доп. туннель">✕</button>');
+    const b=d.querySelector('button');
+    if(b) b.addEventListener('click',function(){
       this.disabled=true;
       fetch('/api/aux_off?id='+encodeURIComponent(a.id),{method:'POST',credentials:'same-origin'})
         .then(function(){ load(); });
@@ -1360,9 +1375,18 @@ async function openProfile(id){
   PD=r;
   document.getElementById('pdt').textContent=(r.type==='openvpn'?'OpenVPN':'WireGuard')+' · '+esc(r.config||'');
   let meta=(r.remotes||[]).join(', ')||'адрес сервера не найден';
-  meta+=(r.mode==='full'?' · весь трафик (в конфиге)':
-         (r.mode==='full-server'?' · весь трафик (сервер присылает redirect-gateway)':
-          (r.mode==='split'?' · split':' · режим уточнится после подключения')));
+  const _ax=(S.aux||[]).filter(function(a){return a.id===id;})[0];
+  if(_ax){
+    // подключён как доп.: он по определению несёт только свои сети
+    meta+=' · подключён доп. туннелем: '+((_ax.routes||[]).length)+' маршр., интернет не забирает'
+        +(_ax.up?'':' (сейчас не поднят)');
+  } else if(S.active_id===id && S.phase==='on'){
+    meta+=' · сейчас: '+(S.tunnel.default_via_tunnel?'весь трафик':'split');
+  } else {
+    meta+=(r.mode==='full'?' · весь трафик (в конфиге)':
+           (r.mode==='full-server'?' · весь трафик (сервер присылает redirect-gateway)':
+            (r.mode==='split'?' · split':' · режим уточнится после первого подключения')));
+  }
   if(r.has_creds) meta+=' · есть логин/пароль';
   if(r.has_pass) meta+=' · ключ под паролем';
   if((r.missing||[]).length) meta+=' · не хватает: '+r.missing.join(', ');
