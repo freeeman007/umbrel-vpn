@@ -8,7 +8,7 @@ log() { echo "$(date -u +%FT%TZ) boot: $*" ; }
 # зеркала: сначала тег релиза в jsDelivr (кэш тегов иммутабельный, поэтому не бывает
 # устаревших скриптов), затем raw.githubusercontent как запас. @main не использовать:
 # jsDelivr держит кэш ветки часами и app.py приезжает старый.
-MIRRORS="https://cdn.jsdelivr.net/gh/freeeman007/umbrel-vpn@v3.2.0/vpn-az/scripts
+MIRRORS="https://cdn.jsdelivr.net/gh/freeeman007/umbrel-vpn@v3.2.1/vpn-az/scripts
 https://raw.githubusercontent.com/freeeman007/umbrel-vpn/main/vpn-az/scripts"
 
 mkdir -p "$DATA" "$DATA/profiles" "$DATA/state"
@@ -58,8 +58,33 @@ fetch() {
     return 1
 }
 
-fetch net.sh 8000
-fetch app.py 20000
+# --- доставка из смонтированного каталога (надёжнее любого CDN) ---
+# /code монтируется в compose с хоста (~/vpn-code): Hermes кладёт туда свежие
+# скрипты по SSH, приложение забирает их без интернета и без обновления из стора.
+SRC=${SRC:-/code}
+
+# sync_src — забрать net.sh/app.py из $SRC, если там другая версия. 0 = что-то обновили
+sync_src() {
+    _ch=0
+    for _f in net.sh app.py; do
+        [ -s "$SRC/$_f" ] || continue
+        if ! cmp -s "$SRC/$_f" "$DATA/$_f"; then
+            if cp "$SRC/$_f" "$DATA/$_f"; then
+                log "скрипт $_f обновлён из $SRC ($(wc -c <"$DATA/$_f") байт)"
+                _ch=1
+            fi
+        fi
+    done
+    return $_ch
+}
+
+if [ -s "$SRC/app.py" ]; then
+    sync_src
+else
+    log "в $SRC нет скриптов — тяну с зеркал"
+    fetch net.sh 8000
+    fetch app.py 20000
+fi
 chmod +x "$DATA/net.sh" 2>/dev/null
 
 trim() {
@@ -69,6 +94,18 @@ trim() {
 }
 
 log "старт статус-сервера"
+
+# раз в минуту сверяем $SRC: если скрипты обновились — перезапускаем статус-сервер
+(
+    while :; do
+        sleep 60
+        if sync_src; then
+            log "перезапуск статус-сервера после обновления из $SRC"
+            pkill -f "$DATA/app.py" 2>/dev/null
+        fi
+    done
+) &
+
 while :; do
     if [ -f "$DATA/app.py" ] && command -v python3 >/dev/null 2>&1; then
         python3 -u "$DATA/app.py" >>"$DATA/app.log" 2>&1

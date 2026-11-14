@@ -22,8 +22,10 @@ services:
       TZ: Europe/Moscow
     volumes:
       - ${APP_DATA_DIR}/data:/data
-    # код тянется из двух CDN по очереди (jsDelivr, затем raw.githubusercontent),
-    # в /data всегда остаётся последняя рабочая копия — при недоступности сети приложение стартует с неё
+      - /home/umbrel/vpn-code:/code:ro
+    # код доставляется каталогом /code (монтируется с хоста, путь выше) — работает без
+    # интернета; если каталог пуст, запасной путь: два CDN по очереди, в /data всегда
+    # остаётся последняя рабочая копия
     command:
       - /bin/sh
       - -c
@@ -31,10 +33,14 @@ services:
         apk add --no-cache ca-certificates curl >/dev/null 2>&1
         update-ca-certificates >/dev/null 2>&1 || true
         mkdir -p /data
-        # ВНИМАНИЕ: docker compose подставляет $VAR в этой строке, поэтому переменных
-        # оболочки здесь быть не должно — счётчик заменён литеральным списком.
+        # основной путь доставки: каталог /code, смонтированный с хоста
+        if [ -s /code/boot.sh ]; then
+          cp /code/boot.sh /data/boot.sh && exec /bin/sh /data/boot.sh
+        fi
+        # запасной путь: зеркала. ВНИМАНИЕ: docker compose подставляет $VAR в этой
+        # строке, поэтому переменных оболочки здесь быть не должно.
         for attempt in 1 2 3 4 5 6; do
-          curl -fsS --max-time 25 "https://cdn.jsdelivr.net/gh/freeeman007/umbrel-vpn@v3.2.0/vpn-az/scripts/boot.sh" -o /data/boot.sh.new || \
+          curl -fsS --max-time 25 "https://cdn.jsdelivr.net/gh/freeeman007/umbrel-vpn@v3.2.1/vpn-az/scripts/boot.sh" -o /data/boot.sh.new || \
           curl -fsS --max-time 25 "https://raw.githubusercontent.com/freeeman007/umbrel-vpn/main/vpn-az/scripts/boot.sh" -o /data/boot.sh.new || true
           if [ -s /data/boot.sh.new ]; then
             mv /data/boot.sh.new /data/boot.sh
