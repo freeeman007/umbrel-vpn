@@ -314,11 +314,50 @@ probe_direct() {
     ping -c1 -W3 1.1.1.1 >/dev/null 2>&1
 }
 
+# --- DNS при полном туннеле -------------------------------------------------
+# В полном туннеле запросы к публичным резолверам уходят внутрь туннеля, а внешний
+# DNS там не отвечает — сервер остаётся без имён: сайты по IP открываются, а curl
+# падает. Поэтому DNS-запросы самого хоста (и host-network приложений) уводим в
+# резолвер туннеля, а контейнеры — через перехват в dnsmasq приложения.
+TUNNEL_DNS=${AZ_TUNNEL_DNS:-10.29.0.1}
+
+tunnel_dns_on() {
+    iptables -t nat -N VPN_DNS 2>/dev/null || true
+    for _p in udp tcp; do
+        iptables -t nat -C OUTPUT -p "$_p" --dport 53 -j VPN_DNS 2>/dev/null || \
+            iptables -t nat -A OUTPUT -p "$_p" --dport 53 -j VPN_DNS 2>/dev/null
+    done
+    iptables -t nat -F VPN_DNS 2>/dev/null
+    iptables -t nat -A VPN_DNS -d 192.168.0.0/16 -j RETURN 2>/dev/null
+    iptables -t nat -A VPN_DNS -d 10.0.0.0/8 -j RETURN 2>/dev/null
+    iptables -t nat -A VPN_DNS -j DNAT --to-destination "$TUNNEL_DNS:53" 2>/dev/null
+    log "dns: DNS хоста -> резолвер туннеля $TUNNEL_DNS"
+}
+
+tunnel_dns_off() {
+    for _p in udp tcp; do
+        while iptables -t nat -D OUTPUT -p "$_p" --dport 53 -j VPN_DNS 2>/dev/null; do :; done
+    done
+    iptables -t nat -F VPN_DNS 2>/dev/null
+    iptables -t nat -X VPN_DNS 2>/dev/null
+}
+
+# dns_probe — резолвится ли имя через резолвер туннеля (3 попытки по 5 с)
+dns_probe() {
+    _i=0
+    while [ "$_i" -lt 3 ]; do
+        nslookup example.com "$TUNNEL_DNS" >/dev/null 2>&1 && return 0
+        sleep 5; _i=$((_i+1))
+    done
+    return 1
+}
+
 stop_tunnel() { # снять всё, что относится к туннелю, не трогая выбор профиля
     _id=$(active_id)
     ovpn_stop "$_id"
     wg_stop
     dnat_off
+    tunnel_dns_off
 }
 
 # connect <id> — поднять профиль с автооткатом
@@ -340,6 +379,11 @@ connect() {
     if dns_up; then dnat_wanted && dnat_on; else dnat_off; fi
     lan_access_wanted && lan_access_on
 
+    # полный туннель: без этого имена перестают резолвиться (внешний DNS в туннеле не отвечает)
+    if tunnel_is_default; then
+        tunnel_dns_on
+    fi
+
     # ждём, пока трафик реально пойдёт через туннель; иначе откат
     if tunnel_is_default; then
         _i=0
@@ -353,6 +397,13 @@ connect() {
             set_error "через туннель нет связи за ${PROBE_TIMEOUT} с — туннель выключен автоматически"
             set_phase failed
             probe_direct || log "откат: прямой сети тоже нет!"
+            return 1
+        fi
+        if ! dns_probe; then
+            log "connect[$_id]: через туннель не резолвятся имена — откат"
+            stop_tunnel
+            set_error "через туннель не работают имена (DNS) — туннель выключен автоматически"
+            set_phase failed
             return 1
         fi
     else
