@@ -19,7 +19,7 @@ import zlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
-VERSION = "3.2.3"
+VERSION = "3.3.0"
 DATA = os.environ.get("DATA", "/data")
 PORT = int(os.environ.get("APP_PORT", "8666"))
 NET_SH = os.path.join(DATA, "net.sh")
@@ -29,7 +29,9 @@ DNS_PORT = os.environ.get("DNS_PORT", "5399")
 PASSWORD = (os.environ.get("APP_PASSWORD") or "").strip()
 MAX_BODY = 8 * 1024 * 1024
 
-EGRESS = {"direct": None, "tunnel": None, "at": 0}
+EGRESS = {"direct": None, "tunnel": None, "at": 0, "src_direct": "", "src_tunnel": "",
+          "err_direct": "", "err_tunnel": ""}
+EGRESS_WAKE = threading.Event()
 CONN_LOCK = threading.Lock()
 TOKEN = ""
 COOKIE = "vpnaz"
@@ -136,8 +138,12 @@ def conf_type(path):
     return "openvpn" if path.lower().endswith(".ovpn") else ("wireguard" if path.endswith(".conf") else "none")
 
 
+AWG_KEYS = re.compile(r"^[ \t]*(Jc|Jmin|Jmax|S[1-4]|H[1-4]|I[1-5])[ \t]*=", re.I | re.M)
+
+
 def conf_meta(path):
-    meta = {"remotes": [], "full_tunnel": False, "auth_user_pass": False, "external_files": []}
+    meta = {"remotes": [], "full_tunnel": False, "auth_user_pass": False,
+            "external_files": [], "awg": False}
     if not path or not os.path.exists(path):
         return meta
     txt = read(path)
@@ -154,6 +160,7 @@ def conf_meta(path):
         if m and not m.group(2).startswith("<") and "/" not in m.group(2) and not m.group(2).startswith("["):
             meta["external_files"].append(m.group(2))
     if path.endswith(".conf"):
+        meta["awg"] = bool(AWG_KEYS.search(txt))
         if re.search(r"AllowedIPs\s*=.*0\.0\.0\.0/0", txt):
             meta["full_tunnel"] = True
         m = re.search(r"Endpoint\s*=\s*(\S+)", txt)
@@ -184,6 +191,7 @@ def profile(pid):
         "remotes": meta["remotes"],
         "full_tunnel": meta["full_tunnel"],
         "has_creds": os.path.exists(os.path.join(d, "cred.txt")),
+        "awg": bool(meta.get("awg")),
         "files": [f for f in files if f != "profile.json"],
         "missing": [f for f in meta["external_files"] if not os.path.exists(os.path.join(d, f))],
     }
@@ -256,6 +264,10 @@ def import_files(files, name="", user="", password=""):
         warnings.append("логин/пароль сохранены в cred.txt")
     if meta.get("missing"):
         warnings.append("в профиле упомянуты файлы, которых нет: " + ", ".join(meta["missing"]))
+    if not is_ovpn and AWG_KEYS.search(text):
+        warnings.append("в конфиге есть параметры AmneziaWG (Jc/S1/H1…): приложение работает "
+                        "на обычном WireGuard и эти строки при подключении отбросит — "
+                        "сервер должен принимать обычный WireGuard")
     return pid, warnings
 
 
@@ -365,21 +377,66 @@ def dns_listening():
         return False
 
 
-def egress_loop():
+# --- внешний IP -------------------------------------------------------------
+# Несколько независимых сервисов: раньше был один ifconfig.me, и любой сбой
+# (нет CA-бандла, 429, DNS в момент подключения туннеля) оставлял «—» навсегда
+# до следующего цикла. Вторая попытка с -k: если в контейнере нет доверия к CA,
+# HTTPS-проверка молча падает, а HTTP-эндпоинт ниже работает всегда.
+IP_SERVICES = (
+    ("ifconfig.me", "https://ifconfig.me/ip"),
+    ("api.ipify.org", "https://api.ipify.org"),
+    ("icanhazip.com", "https://icanhazip.com"),
+    ("ipinfo.io", "https://ipinfo.io/ip"),
+    ("ip-api.com", "http://ip-api.com/line/?fields=query"),
+)
+IPV4_RE = re.compile(r"(?:\d{1,3}\.){3}\d{1,3}")
+
+
+def probe_egress(dev="", limit=5, budget=22):
+    """Внешний IP: dev="" — обычным путём, иначе исход через интерфейс туннеля.
+    Возвращает (ip, источник, ошибка)."""
+    errs = []
+    t0 = time.time()
+    for name, url in IP_SERVICES[:limit]:
+        for insecure in (False, True):
+            if insecure and not url.startswith("https:"):
+                continue
+            if time.time() - t0 > budget:
+                break
+            cmd = ["curl", "-4", "-s", "--max-time", "7"]
+            if insecure:
+                cmd.append("-k")
+            if dev:
+                cmd += ["--interface", dev]
+            out = run(cmd + [url], timeout=12).strip()
+            if IPV4_RE.fullmatch(out):
+                return out, name + ("/-k" if insecure else ""), ""
+            errs.append("%s%s: %s" % (name, "/-k" if insecure else "", (out or "нет ответа")[:40]))
+    return None, "", "; ".join(errs)[:300]
+
+
+def egress_once():
     global EGRESS
+    direct, dsrc, derr = probe_egress("")
+    dev = tun_dev()
+    if dev:
+        tunnel, tsrc, terr = probe_egress(dev, limit=3)
+    else:
+        tunnel, tsrc, terr = None, "", "туннель не поднят"
+    EGRESS = {"direct": direct, "tunnel": tunnel, "at": int(time.time()),
+              "src_direct": dsrc, "src_tunnel": tsrc,
+              "err_direct": derr, "err_tunnel": terr}
+    return EGRESS
+
+
+def egress_loop():
     while True:
-        direct = run(["curl", "-s", "--max-time", "6", "https://ifconfig.me"])
-        if not re.fullmatch(r"[0-9.]{7,15}", direct or ""):
-            direct = None
-        tunnel = None
-        dev = tun_dev()
-        if dev:
-            out = run(["curl", "-s", "--max-time", "8", "--interface", dev, "https://ifconfig.me"])
-            if re.fullmatch(r"[0-9.]{7,15}", out or ""):
-                tunnel = out
-        EGRESS = {"direct": direct or EGRESS.get("direct"), "tunnel": tunnel or EGRESS.get("tunnel"),
-                  "at": int(time.time())}
-        time.sleep(90)
+        try:
+            egress_once()
+        except Exception:  # noqa: BLE001
+            pass
+        EGRESS_WAKE.wait(90)
+        EGRESS_WAKE.clear()
 
 
 def status():
@@ -407,6 +464,7 @@ def status():
         "dns": {"port": DNS_PORT, "listening": dns_listening(),
                 "override": os.path.exists(os.path.join(STATE, "dns_on"))},
         "autostart": os.path.exists(os.path.join(STATE, "autostart")),
+        "warn": state("warn"),
         "lan": {"nat": os.path.exists(os.path.join(STATE, "lan_access"))},
         "egress": EGRESS,
         "direct_ok": probe_direct(),
@@ -457,12 +515,17 @@ def do_connect(pid):
         return phase() == "on"
     finally:
         CONN_LOCK.release()
+        EGRESS_WAKE.set()  # сразу пересчитать внешние IP, не ждать 90 с
 
 
 def do_disconnect():
     net("disconnect", timeout=90)
-    # пользователь выключил туннель руками — автоподъём при следующем старте не нужен
-    net("forget", timeout=30)
+    # пользователь выключил туннель руками: «вернуть как было» после ребута не надо,
+    # но настройку «автоподключение при старте» не трогаем — это отдельный переключатель
+    p = os.path.join(STATE, "want_on")
+    if os.path.exists(p):
+        os.remove(p)
+    EGRESS_WAKE.set()
 
 
 def watch_loop():
@@ -488,7 +551,12 @@ def boot():
         # туннель был включён до перезагрузки сервера/перезапуска контейнера:
         # net.sh resume сам дождётся сети, поднимет профиль и повторит попытку при сбое
         _pid = _act
-        threading.Thread(target=lambda: net("resume", _pid, timeout=300), daemon=True).start()
+
+        def _resume():
+            net("resume", _pid, timeout=300)
+            EGRESS_WAKE.set()
+
+        threading.Thread(target=_resume, daemon=True).start()
     elif ph == "connecting":
         # контейнер упал посреди подключения — не оставляем полутуннель
         net("disconnect", timeout=60)
@@ -675,10 +743,12 @@ border-radius:50%;animation:r 1s linear infinite;vertical-align:-2px;margin-righ
 </div>
 
 <div class="card">
-  <div class="row"><span class="k">Внешний IP напрямую</span><span class="v" id="e1">—</span></div>
+  <div class="row"><span class="k">Внешний IP напрямую</span><span class="v"><span id="e1">—</span>
+    <button class="ico" id="egb" onclick="refreshIp()" title="Проверить IP сейчас">⟳</button></span></div>
   <div class="row"><span class="k">Внешний IP через туннель</span><span class="v ok" id="e2">—</span></div>
   <div class="row"><span class="k">Адрес в туннеле</span><span class="v" id="tip">—</span></div>
   <div class="row"><span class="k">Весь трафик через VPN</span><span class="v" id="full">—</span></div>
+  <div class="hint" id="eghint">определяю внешний IP…</div>
 </div>
 
 <div class="sec">Профили</div>
@@ -688,9 +758,17 @@ border-radius:50%;animation:r 1s linear infinite;vertical-align:-2px;margin-righ
 <div class="sec">Сервис</div>
 <div class="card">
   <div class="row"><span class="k">Перехват DNS всех приложений</span><div class="sw" id="swdns" onclick="setOpt('dns')"></div></div>
-  <div class="row"><span class="k">Включать туннель при запуске</span><div class="sw" id="swauto" onclick="setOpt('auto')"></div></div>
+  <div class="hint" style="margin:-2px 0 10px">Все запросы на порт 53 (UDP и TCP) от приложений Umbrel
+    уходят в локальный резолвер Umbrel, а он спрашивает 1.1.1.1 напрямую, мимо туннеля. Спасает, когда
+    VPN-сервер перехватывает DNS и отдаёт адреса, по которым ничего не открывается. DoH/DoT (443/853) не трогает.</div>
+  <div class="row"><span class="k">Автоподключение при старте</span><div class="sw" id="swauto" onclick="setOpt('auto')"></div></div>
+  <div class="hint" style="margin:-2px 0 10px">Поднимать выбранный профиль сам после перезагрузки Umbrel
+    или перезапуска приложения — даже если туннель был выключен вручную.</div>
   <div class="row"><span class="k">NAT в домашнюю сеть</span><div class="sw" id="swlan" onclick="setOpt('lan')"></div></div>
+  <div class="hint" style="margin:-2px 0 0">Пускать клиентов VPN (10.28.0.0/22) в домашнюю сеть
+    192.168.11.0/24 через этот Umbrel: ноутбук в VPN увидит NAS, принтер, веб-морду роутера.</div>
 </div>
+<div class="hint bad" id="warn" style="display:none"></div>
 <button class="ghost" onclick="diag()">Диагностика и журнал</button>
 
 <dialog id="imp">
@@ -749,6 +827,21 @@ function render(){
   const fld=document.getElementById('full');
   fld.textContent=t.default_via_tunnel?'да':'нет';
   fld.className='v '+(t.default_via_tunnel?'ok':'');
+  const eh=document.getElementById('eghint');
+  if(!eg.at){ eh.textContent='определяю внешний IP…'; eh.className='hint'; }
+  else{
+    const tt=new Date(eg.at*1000).toLocaleTimeString('ru-RU',{hour:'2-digit',minute:'2-digit'});
+    let m='проверено в '+tt;
+    if(!eg.direct) m+=' · прямой IP не определился'+(eg.err_direct?' ('+String(eg.err_direct).slice(0,110)+')':'');
+    if(t.dev&&!eg.tunnel){
+      m+=' · через туннель не определился';
+      if(!t.default_via_tunnel) m+=' (профиль сплит: в туннель идут только адреса из AllowedIPs)';
+      else if(eg.err_tunnel) m+=' ('+String(eg.err_tunnel).slice(0,110)+')';
+    }
+    eh.textContent=m; eh.className='hint'+(eg.direct?'':' bad');
+  }
+  const wd=document.getElementById('warn');
+  if(S.warn){ wd.style.display='block'; wd.textContent=S.warn; } else { wd.style.display='none'; }
   document.getElementById('swdns').className='sw'+(S.dns&&S.dns.override?' on':'');
   document.getElementById('swauto').className='sw'+(S.autostart?' on':'');
   document.getElementById('swlan').className='sw'+(S.lan&&S.lan.nat?' on':'');
@@ -757,6 +850,7 @@ function render(){
   box.innerHTML=list.map(function(x){
     const sel=x.id===S.active_id;
     const meta=(x.type==='openvpn'?'OpenVPN':'WireGuard')+(x.full_tunnel?' · весь трафик':'' )+
+      (x.awg?' · AmneziaWG-параметры не применяются':'')+
       (x.remotes&&x.remotes.length?' · '+x.remotes[0]:'')+(x.missing&&x.missing.length?' · нет файлов: '+x.missing.join(','):'');
     return '<div class="prof'+(sel?' sel':'')+'" onclick="pick(\\''+x.id+'\\')">'+
       '<span class="dot"></span><div style="min-width:0"><div class="pname">'+esc(x.name)+'</div>'+
@@ -783,8 +877,15 @@ async function setOpt(what){
   if(what==='dns') on=!(S.dns&&S.dns.override);
   else if(what==='auto') on=!S.autostart;
   else on=!(S.lan&&S.lan.nat);
-  await api('/api/'+what+(on?'_on':'_off'),{method:'POST'});
+  const r=await api('/api/'+what+(on?'_on':'_off'),{method:'POST'});
+  if(what==='auto'&&r&&r.ok===false){ alert(r.error||'не удалось включить автоподключение'); }
   load();
+}
+async function refreshIp(){
+  const b=document.getElementById('egb'); b.disabled=true; b.textContent='…';
+  await api('/api/egress',{method:'POST'});
+  setTimeout(load,1500); setTimeout(load,5000);
+  setTimeout(function(){ b.disabled=false; b.textContent='⟳'; },6500);
 }
 async function del(id){
   if(!confirm('Удалить профиль?'))return;
@@ -931,13 +1032,28 @@ class Handler(BaseHTTPRequestHandler):
             flag = os.path.join(STATE, "autostart")
             on = u.path.endswith("_on")
             if on:
+                if not state("active"):
+                    return self._send(400, json.dumps(
+                        {"ok": False, "error": "сначала выбери профиль — тогда будет что включать"},
+                        ensure_ascii=False))
                 write(flag, "1\n")
+                # туннель сейчас включён — запомним и «вернуть как было», чтобы после
+                # ребута поднялся именно этот профиль
+                if phase() == "on":
+                    write(os.path.join(STATE, "want_on"), "1\n")
             else:
-                # выключили автостарт — снимаем и намерение, иначе resume поднимет туннель
-                net("forget", timeout=30)
-                if os.path.exists(flag):
-                    os.remove(flag)
+                for f in ("autostart", "want_on"):
+                    p = os.path.join(STATE, f)
+                    if os.path.exists(p):
+                        os.remove(p)
+                # не автоподключаемся — значит и восстанавливать после ребута нечего
             return self._send(200, json.dumps({"ok": True, "on": on}))
+
+        if u.path == "/api/egress":
+            # пересчёт внешних IP в фоне: проба ходит по 4-5 сервисам и может
+            # занимать до 20 с, а панель опрашивает статус каждые 3 с
+            threading.Thread(target=egress_once, daemon=True).start()
+            return self._send(200, json.dumps({"ok": True, "egress": EGRESS}, ensure_ascii=False))
 
         if u.path in ("/api/dns_on", "/api/dns_off", "/api/lan_on", "/api/lan_off"):
             what = "dns" if "dns" in u.path else "lan"

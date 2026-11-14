@@ -28,6 +28,10 @@ set_phase()  { mkdir -p "$STATE"; printf '%s\n' "$1" > "$STATE/phase" ; }
 error()      { cat "$STATE/error" 2>/dev/null ; }
 set_error()  { mkdir -p "$STATE"; printf '%s\n' "$1" > "$STATE/error" ; }
 clear_error(){ rm -f "$STATE/error" ; }
+# предупреждение (не ошибка): подключение состоялось, но что-то пришлось поправить
+warn()       { cat "$STATE/warn" 2>/dev/null ; }
+set_warn()   { mkdir -p "$STATE"; printf '%s\n' "$1" > "$STATE/warn" ; }
+clear_warn() { rm -f "$STATE/warn" ; }
 active_id()  { cat "$STATE/active" 2>/dev/null | tr -d ' \n' ; }
 set_active() { mkdir -p "$STATE"; printf '%s\n' "$1" > "$STATE/active" ; }
 clear_active(){ rm -f "$STATE/active" ; }
@@ -201,6 +205,13 @@ wg_stop() {
 
 conf_get() { sed -n "s/^[[:space:]]*$1[[:space:]]*=[[:space:]]*//p" "$2" | head -1 | sed 's/[[:space:]]*$//' ; }
 
+# AmneziaWG-параметры (Jc/Jmin/Jmax/S1..S4/H1..H4/I1..I5) понимает только awg.
+# Обычный wg падает на всём файле из-за первой же такой строки («wg setconf:
+# ошибка в конфиге»), хотя остальное — валидный WireGuard. Поэтому такие строки
+# отбрасываем и предупреждаем в панели; если серверу действительно нужен AWG,
+# рукопожатия не будет и это будет видно отдельной ошибкой ниже.
+AWG_RE='^[[:space:]]*(Jc|Jmin|Jmax|S[1-4]|H[1-4]|I[1-5])[[:space:]]*='
+
 wg_start() { # wg_start <id>
     _id=$1; _conf=$(prof_conf "$_id")
     [ -f "$_conf" ] || { set_error "нет конфига в профиле"; return 1; }
@@ -209,11 +220,20 @@ wg_start() { # wg_start <id>
     _addr=$(conf_get Address "$_conf")
     _mtu=$(conf_get MTU "$_conf"); [ -n "$_mtu" ] || _mtu=1420
     _ep=$(conf_get Endpoint "$_conf")
-    _ep_host=${_ep%:*}; 
+    _ep_host=${_ep%:*}
     _ep_ip=$(resolve4 "$_ep_host"); [ -n "$_ep_ip" ] || _ep_ip=$_ep_host
     [ -n "$_ep_ip" ] && [ -n "${LAN_GW:-}" ] && ip route replace "$_ep_ip/32" via "$LAN_GW" dev "$LAN_IF" 2>/dev/null
-    grep -vE '^[[:space:]]*(Address|DNS|MTU)[[:space:]]*=' "$_conf" > /run/wg0.strip
-    wg setconf "$WG0" /run/wg0.strip 2>/dev/null || { set_error "wg setconf: ошибка в конфиге"; return 1; }
+    _awg=0
+    grep -qE "$AWG_RE" "$_conf" 2>/dev/null && _awg=1
+    grep -vE '^[[:space:]]*(Address|DNS|MTU)[[:space:]]*=' "$_conf" | grep -vE "$AWG_RE" > /run/wg0.strip
+    if ! _werr=$(wg setconf "$WG0" /run/wg0.strip 2>&1); then
+        set_error "wg setconf: $(printf '%s' "$_werr" | head -2 | tr '\n' ' ')"
+        return 1
+    fi
+    if [ "$_awg" = 1 ]; then
+        set_warn "в профиле были параметры AmneziaWG (Jc/S1/H1…) — обычный WireGuard их не понимает, они отброшены; туннель поднят как обычный WireGuard"
+        log "wg[$_id]: строки AmneziaWG из конфига убраны"
+    fi
     echo "$_addr" | grep -q '/' || _addr="$_addr/32"
     ip -4 addr show dev "$WG0" | grep -q " ${_addr%/*}/" || ip -4 addr add "$_addr" dev "$WG0"
     ip link set mtu "$_mtu" up dev "$WG0" || { set_error "wg0 не поднимается"; return 1; }
@@ -227,7 +247,20 @@ wg_start() { # wg_start <id>
     rule_ensure mangle OUTPUT -o "$WG0" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
     protect_lan
     protect_resolvers
-    log "wg[$_id]: up $(conf_get Address "$_conf")"
+
+    # Подтверждение рукопожатия: при неверном порту, ключе или мёртвом сервере wg
+    # не ругается — интерфейс просто молчит, а панель показывала «подключено».
+    _i=0; _hs=0
+    while [ "$_i" -lt 15 ]; do
+        _hs=$(wg show "$WG0" latest-handshakes 2>/dev/null | awk 'NR==1{print $2+0}')
+        [ "${_hs:-0}" -gt 0 ] && break
+        sleep 1; _i=$((_i+1))
+    done
+    if [ "${_hs:-0}" -le 0 ]; then
+        set_error "WireGuard не получил рукопожатие за 15 с: $_ep не отвечает или ключи не подходят"
+        return 1
+    fi
+    log "wg[$_id]: up $(conf_get Address "$_conf"), рукопожатие есть"
     return 0
 }
 
@@ -425,6 +458,7 @@ stop_tunnel() { # снять всё, что относится к туннелю
     dnat_off
     tunnel_dns_off
     unprotect_resolvers
+    clear_warn
 }
 
 # connect <id> — поднять профиль с автооткатом
@@ -503,7 +537,7 @@ disconnect() {
 # --- автоподъём после перезагрузки -------------------------------------------
 # want_on ставится, когда пользователь включает туннель, и снимается при выключении:
 # именно он отличает «сервер перезагрузился» от «пользователь сам выключил VPN».
-want_on_set()   { mkdir -p "$STATE"; : > "$STATE/want_on"; : > "$STATE/autostart" ; }
+want_on_set()   { mkdir -p "$STATE"; : > "$STATE/want_on" ; }
 want_on_clear() { rm -f "$STATE/want_on" "$STATE/autostart" ; }
 
 # net_ready — есть default-маршрут и резолвятся имена (после ребута сеть поднимается не сразу)
@@ -602,6 +636,7 @@ status() {
     echo "phase: $_ph"
     echo "active: $_id ($_type)"
     echo "error: $(error)"
+    echo "warn: $(warn)"
     echo "since: $(since)"
     case "$_type" in
         ovpn) echo "ovpn: alive=$(ovpn_alive "$_id" && echo yes || echo no) ip=$(tun_ip) pid=$(cat "$(ovpn_pid_file "$_id")" 2>/dev/null)" ;;
