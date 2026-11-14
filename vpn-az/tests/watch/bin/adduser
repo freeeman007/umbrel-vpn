@@ -1,0 +1,3 @@
+#!/bin/sh
+# заглушка BusyBox adduser: на Debian-хосте иначе печатает usage и мешает логу
+exit 0

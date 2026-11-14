@@ -1,0 +1,4 @@
+#!/bin/sh
+# заглушка: openvpn «не запускается», чтобы connect упал быстро и без сети
+echo "stub openvpn: $*" >> "$LOG"
+exit 1

@@ -40,7 +40,7 @@ services:
         # запасной путь: зеркала. ВНИМАНИЕ: docker compose подставляет $VAR в этой
         # строке, поэтому переменных оболочки здесь быть не должно.
         for attempt in 1 2 3 4 5 6; do
-          curl -fsS --max-time 25 "https://cdn.jsdelivr.net/gh/freeeman007/umbrel-vpn@v3.2.1/vpn-az/scripts/boot.sh" -o /data/boot.sh.new || \
+          curl -fsS --max-time 25 "https://cdn.jsdelivr.net/gh/freeeman007/umbrel-vpn@v3.3.0/vpn-az/scripts/boot.sh" -o /data/boot.sh.new || \
           curl -fsS --max-time 25 "https://raw.githubusercontent.com/freeeman007/umbrel-vpn/main/vpn-az/scripts/boot.sh" -o /data/boot.sh.new || true
           if [ -s /data/boot.sh.new ]; then
             mv /data/boot.sh.new /data/boot.sh
