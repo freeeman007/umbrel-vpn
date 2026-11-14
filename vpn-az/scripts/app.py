@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# app.py — VPN AZ для Umbrel, v3: библиотека профилей (.ovpn/.wg), connect/disconnect,
+# app.py — VPN для Umbrel, v3: библиотека профилей (.ovpn/.wg), connect/disconnect,
 # автооткат при потере связи, статус, PWA. Только stdlib.
 import base64
 import hashlib
@@ -20,7 +20,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import urllib.request
 from urllib.parse import urlparse, parse_qs
 
-VERSION = "3.4.6"
+VERSION = "3.5.0"
 DATA = os.environ.get("DATA", "/data")
 PORT = int(os.environ.get("APP_PORT", "8666"))
 NET_SH = os.path.join(DATA, "net.sh")
@@ -210,7 +210,7 @@ def save_profile(pid, name, ptype):
           json.dumps({"name": name, "type": ptype, "created": int(time.time())}, ensure_ascii=False))
 
 
-def import_files(files, name="", user="", password=""):
+def import_files(files, name="", user="", password="***", expect=None):
     """files: список (filename, bytes). Возвращает (id, warnings)."""
     cfg = None
     extras = []
@@ -238,6 +238,11 @@ def import_files(files, name="", user="", password=""):
         raise ValueError("в .ovpn нет строки remote — это не профиль подключения")
     if not is_ovpn and ("[Interface]" not in text or "PrivateKey" not in text):
         raise ValueError("в .conf нет [Interface]/PrivateKey — это не WireGuard-конфиг")
+    kind = "openvpn" if is_ovpn else "wireguard"
+    if expect and expect != kind:
+        raise ValueError("это конфиг %s, а профиль добавляется в раздел %s — открой его через свою кнопку"
+                         % ("OpenVPN" if kind == "openvpn" else "WireGuard",
+                            "OpenVPN" if expect == "openvpn" else "WireGuard"))
 
     base_name = name or re.sub(r"\.(ovpn|conf)$", "", os.path.basename(fname))
     pid = new_id(base_name)
@@ -272,7 +277,7 @@ def import_files(files, name="", user="", password=""):
     return pid, warnings
 
 
-def import_any(body, ctype, query):
+def import_any(body, ctype, query, expect=None):
     """Разбирает multipart / zip / сырой текст. Возвращает (id, warnings)."""
     name = (query.get("name") or [""])[0]
     user = (query.get("user") or [""])[0]
@@ -288,7 +293,7 @@ def import_any(body, ctype, query):
             if not inner or inner.startswith("."):
                 continue
             files.append((inner, zf.read(info)))
-        return import_files(files, name, user, pwd)
+        return import_files(files, name, user, pwd, expect=expect)
 
     if "multipart/form-data" in (ctype or ""):
         m = re.search(r"boundary=([^;]+)", ctype)
@@ -316,7 +321,8 @@ def import_any(body, ctype, query):
         name = name or fields.get("name", "")
         user = user or fields.get("user", "")
         pwd = pwd or fields.get("pass", "")
-        return import_files(files, name, user, pwd)
+        expect = expect or fields.get("expect") or None
+        return import_files(files, name, user, pwd, expect=expect)
 
     text = body.decode("utf-8", "replace")
     if text.startswith("conf="):
@@ -324,7 +330,7 @@ def import_any(body, ctype, query):
     if not text.strip():
         raise ValueError("пустой профиль")
     ext = ".conf" if "[Interface]" in text and "PrivateKey" in text else ".ovpn"
-    return import_files([("profile" + ext, text.encode())], name, user, pwd)
+    return import_files([("profile" + ext, text.encode())], name, user, pwd, expect=expect)
 
 
 # ----------------------------------------------------------------- сеть/статус
@@ -516,7 +522,7 @@ APPS_DIR = os.environ.get("APPS_DIR", "/apps")
 # из манифестов и этот не используется.
 FALLBACK_LINKS = [("AdminPanelAZ", 8000), ("Baikal", 8890), ("Cloudflare Tunnel", 4499),
                   ("Hermes Agent", 18790), ("Immich", 2283), ("Murmur", 18793),
-                  ("Nextcloud", 8081), ("VPN AZ", 8666)]
+                  ("Nextcloud", 8081), ("VPN", 8666)]
 TG_CONF = os.path.join(DATA, "telegram.json")
 TG_ON = os.path.join(STATE, "tg_on")
 TG_SENT = os.path.join(STATE, "tg_sent.json")
@@ -612,7 +618,7 @@ def tg_text(reason):
     mode = "весь трафик" if tun.get("default_via_tunnel") else "split"
     links = app_links(ip)
     lines = [
-        "VPN AZ · Umbrel — %s" % reason,
+        "VPN · Umbrel — %s" % reason,
         "профиль: %s (%s)" % (prof, mode),
         "адрес в туннеле: %s" % ip,
         "LAN: %s" % lan,
@@ -748,7 +754,7 @@ def boot():
                 _err = state("error") or phase()
                 if read(os.path.join(STATE, "tg_fail")) != _err:
                     write(os.path.join(STATE, "tg_fail"), _err)
-                    tg_send("VPN AZ · Umbrel — туннель не поднялся\nстатус: %s\nLAN: %s"
+                    tg_send("VPN · Umbrel — туннель не поднялся\nстатус: %s\nLAN: %s"
                             % (_err, ", ".join(lan_addrs()) or "—"))
 
         threading.Thread(target=_resume, daemon=True).start()
@@ -829,8 +835,8 @@ def icon(size):
 
 
 MANIFEST = {
-    "name": "VPN AZ",
-    "short_name": "VPN AZ",
+    "name": "VPN",
+    "short_name": "VPN",
     "start_url": "/",
     "display": "standalone",
     "background_color": "#0e1116",
@@ -845,7 +851,7 @@ MANIFEST = {
 # ----------------------------------------------------------------- UI
 LOGIN_PAGE = """<!doctype html><html lang="ru"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><meta name="theme-color" content="#0e1116">
-<title>VPN AZ</title><style>
+<title>VPN</title><style>
 body{margin:0;height:100vh;display:flex;align-items:center;justify-content:center;background:#0e1116;
 color:#e8ecf1;font:15px/1.5 system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
 form{background:#161a21;border:1px solid #232936;border-radius:16px;padding:26px;width:min(340px,86vw)}
@@ -856,7 +862,7 @@ button{width:100%;background:#3ddc84;color:#08110c;border:0;border-radius:10px;p
 font-size:15px;font-weight:600;cursor:pointer}
 </style></head><body>
 <form method="post" action="/api/login">
-  <h1>VPN AZ</h1><p>Пароль приложения — в карточке приложения в Umbrel</p>
+  <h1>VPN</h1><p>Пароль приложения — в карточке приложения в Umbrel</p>
   <input type="password" name="password" placeholder="пароль" autofocus autocomplete="current-password">
   <button type="submit">Войти</button>
 </form></body></html>"""
@@ -865,7 +871,7 @@ PAGE = """<!doctype html><html lang="ru"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <meta name="theme-color" content="#0e1116"><link rel="manifest" href="/manifest.webmanifest">
 <link rel="apple-touch-icon" href="/icon-192.png">
-<title>VPN AZ</title><style>
+<title>VPN</title><style>
 *{box-sizing:border-box}
 body{margin:0;background:#0e1116;color:#e8ecf1;font:15px/1.5 system-ui,-apple-system,Segoe UI,Roboto,sans-serif;
 padding:18px 16px calc(28px + env(safe-area-inset-bottom));max-width:680px;margin:0 auto}
@@ -890,6 +896,9 @@ transition:transform .12s ease,box-shadow .2s ease;display:flex;align-items:cent
 .psub.bad{color:#ff8080}
 .card{background:#161a21;border:1px solid #232936;border-radius:14px;padding:14px;margin-bottom:12px}
 .sec{font-size:12px;letter-spacing:.6px;text-transform:uppercase;color:#6b7385;margin:18px 0 8px}
+.ph{font-size:12px;letter-spacing:.6px;text-transform:uppercase;color:#93a0b6;margin:16px 0 8px;
+display:flex;align-items:center;gap:7px}
+.ph i{font-style:normal;color:#5d6577;font-size:11px;letter-spacing:0}
 .prof{display:flex;align-items:center;gap:12px;padding:12px;border-radius:12px;border:1px solid #232936;
 background:#161a21;margin-bottom:8px;cursor:pointer;transition:border-color .15s}
 .prof:hover{border-color:#33405a}
@@ -948,7 +957,7 @@ transition:opacity .13s ease,transform .13s ease,visibility .13s}
   .q:hover::after,.q:focus::after,.q.open::after{transform:none}
 }
 </style></head><body>
-<div class="top"><h1>VPN AZ</h1><span class="pill" id="pill">…</span></div>
+<div class="top"><h1>VPN</h1><span class="pill" id="pill">…</span></div>
 
 <div class="power-wrap">
   <button class="power" id="power" onclick="toggle()" aria-label="Включить или выключить">
@@ -968,8 +977,12 @@ transition:opacity .13s ease,transform .13s ease,visibility .13s}
 </div>
 
 <div class="sec">Профили</div>
-<div id="profiles"></div>
-<button class="ghost" onclick="openImport()">+ Добавить профиль</button>
+<div class="ph">OpenVPN</div>
+<div id="profiles-ovpn"></div>
+<button class="ghost" onclick="openImport('openvpn')">+ Добавить OpenVPN</button>
+<div class="ph">WireGuard</div>
+<div id="profiles-wg"></div>
+<button class="ghost" onclick="openImport('wireguard')">+ Добавить WireGuard</button>
 
 <div class="sec">Сервис</div>
 <div class="card">
@@ -983,8 +996,8 @@ transition:opacity .13s ease,transform .13s ease,visibility .13s}
 <button class="ghost" onclick="tgTest()">Проверить уведомление</button>
 
 <dialog id="imp">
-  <h2>Новый профиль</h2>
-  <label>Файлы: .ovpn / .conf (+ ca.crt, ключи — можно пакетом)</label>
+  <h2 id="impttl">Новый профиль</h2>
+  <label id="implbl">Файлы: .ovpn / .conf (+ ca.crt, ключи — можно пакетом)</label>
   <input type="file" id="files" multiple style="margin-bottom:10px">
   <label>…или вставь текст конфига</label>
   <textarea id="conftext" placeholder="client&#10;dev tun&#10;remote 1.2.3.4 1194&#10;..."></textarea>
@@ -1070,19 +1083,36 @@ function render(){
   document.getElementById('swauto').className='sw'+(S.autostart?' on':'');
   document.getElementById('swlan').className='sw'+(S.lan&&S.lan.nat?' on':'');
   document.getElementById('swtg').className='sw'+(S.tg&&S.tg.enabled?' on':'');
-  const box=document.getElementById('profiles'); const list=S.profiles||[];
-  if(!list.length){ box.innerHTML='<div class="card" style="color:#7d8698;font-size:13px">Профилей нет. Добавь .ovpn или .conf.</div>'; return; }
-  box.innerHTML=list.map(function(x){
+  const list=S.profiles||[];
+  function profCard(x){
     const sel=x.id===S.active_id;
-    const meta=(x.type==='openvpn'?'OpenVPN':'WireGuard')+(x.full_tunnel?' · весь трафик':'' )+
-      (x.awg?' · AmneziaWG-параметры не применяются':'')+
-      (x.remotes&&x.remotes.length?' · '+x.remotes[0]:'')+(x.missing&&x.missing.length?' · нет файлов: '+x.missing.join(','):'');
-    return '<div class="prof'+(sel?' sel':'')+'" onclick="pick(\\''+x.id+'\\')">'+
+    const meta=(x.full_tunnel?'весь трафик · ':'')+
+      (x.remotes&&x.remotes.length?x.remotes[0]+' ':'')+
+      (x.missing&&x.missing.length?'нет файлов: '+x.missing.join(','):'');
+    return '<div class="prof'+(sel?' sel':'')+'" data-id="'+esc(x.id)+'">'+
       '<span class="dot"></span><div style="min-width:0"><div class="pname">'+esc(x.name)+'</div>'+
       '<div class="pmeta">'+esc(meta)+'</div></div>'+
-      '<div class="acts"><button class="ico" onclick="event.stopPropagation();askRename(\\''+x.id+'\\',\\''+esc(x.name).replace(/'/g,'')+'\\')">✎</button>'+
-      '<button class="ico" onclick="event.stopPropagation();del(\\''+x.id+'\\')">✕</button></div></div>';
-  }).join('');
+      '<div class="acts"><button class="ico" data-act="ren" title="Переименовать">✎</button>'+
+      '<button class="ico" data-act="del" title="Удалить">✕</button></div></div>';
+  }
+  function paintProfiles(boxId, arr, empty){
+    const box=document.getElementById(boxId);
+    if(!arr.length){ box.innerHTML='<div class="card" style="color:#7d8698;font-size:13px">'+esc(empty)+'</div>'; return; }
+    box.innerHTML=arr.map(profCard).join('');
+    box.querySelectorAll('.prof').forEach(function(el){
+      const id=el.getAttribute('data-id');
+      const pr=(S.profiles||[]).filter(function(y){return y.id===id;})[0];
+      el.addEventListener('click',function(e){ if(!e.target.closest('[data-act]')) pick(id); });
+      el.querySelector('[data-act="ren"]').addEventListener('click',function(e){
+        e.stopPropagation(); askRename(id,(pr&&pr.name)||''); });
+      el.querySelector('[data-act="del"]').addEventListener('click',function(e){
+        e.stopPropagation(); del(id); });
+    });
+  }
+  paintProfiles('profiles-ovpn', list.filter(function(x){return x.type==='openvpn';}),
+    'Профилей OpenVPN нет — добавь .ovpn кнопкой ниже.');
+  paintProfiles('profiles-wg', list.filter(function(x){return x.type!=='openvpn';}),
+    'Профилей WireGuard нет — добавь .conf кнопкой ниже.');
 }
 function esc(s){ return String(s).replace(/[&<>"]/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c];}); }
 async function toggle(){
@@ -1148,7 +1178,23 @@ async function askRename(id,cur){
   const n=prompt('Название профиля',cur); if(!n)return;
   await api('/api/rename?id='+encodeURIComponent(id)+'&name='+encodeURIComponent(n),{method:'POST'}); load();
 }
-function openImport(){ document.getElementById('impout').textContent=''; document.getElementById('imp').showModal(); }
+let IMPPROTO='openvpn';
+function openImport(proto){
+  IMPPROTO=(proto==='wireguard')?'wireguard':'openvpn';
+  const wg=IMPPROTO==='wireguard';
+  document.getElementById('impttl').textContent='Новый профиль '+(wg?'WireGuard':'OpenVPN');
+  document.getElementById('implbl').textContent=wg
+    ?'Файлы .conf (+ ключи, если лежат отдельно) или вставь текст'
+    :'Файлы .ovpn (+ ca.crt, ключи — можно пакетом) или вставь текст';
+  document.getElementById('files').setAttribute('accept', wg?'.conf':'*.ovpn,.ovpn');
+  document.getElementById('files').value='';
+  document.getElementById('conftext').value='';
+  document.getElementById('nm').value='';
+  document.getElementById('u').value='';
+  document.getElementById('p').value='';
+  document.getElementById('impout').textContent='';
+  document.getElementById('imp').showModal();
+}
 async function doImport(){
   const out=document.getElementById('impout'); out.textContent='загрузка…';
   const fd=new FormData();
@@ -1156,6 +1202,7 @@ async function doImport(){
   for(let i=0;i<fs.length;i++) fd.append('file'+i,fs[i],fs[i].name);
   const txt=document.getElementById('conftext').value.trim();
   if(txt) fd.append('config',new Blob([txt],{type:'text/plain'}), txt.indexOf('[Interface]')>=0?'profile.conf':'profile.ovpn');
+  fd.append('expect',IMPPROTO);
   fd.append('name',document.getElementById('nm').value.trim());
   fd.append('user',document.getElementById('u').value);
   fd.append('pass',document.getElementById('p').value);
@@ -1272,7 +1319,8 @@ class Handler(BaseHTTPRequestHandler):
 
         if u.path == "/api/import":
             try:
-                pid, warnings = import_any(body, self.headers.get("Content-Type", ""), q)
+                pid, warnings = import_any(body, self.headers.get("Content-Type", ""), q,
+                                              expect=(q.get("expect") or [""])[0] or None)
             except Exception as e:  # noqa: BLE001
                 return self._send(400, json.dumps({"error": str(e)}, ensure_ascii=False))
             return self._send(200, json.dumps({"ok": True, "profile": profile(pid),
