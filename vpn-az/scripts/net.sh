@@ -325,11 +325,16 @@ aux_ovpn_up() {
     _extra=""
     [ -f "$_dir/cred.txt" ] && _extra="--auth-user-pass $_dir/cred.txt"
     [ -f "$_dir/pass.txt" ] && _extra="$_extra --askpass $_dir/pass.txt"
+    # один процесс на профиль: остатки прошлой попытки (иначе сервер с одним сеансом
+    # на пользователя отвечает AUTH_FAILED «... is already active»)
+    pkill -f "openvpn.*--dev $_dev" 2>/dev/null || true
     # redirect-gateway и dhcp-option от сервера отбрасываем: default и DNS остаются
-    # у основного туннеля, а push'и нумерации («route 10.0.0.0/8») применяются как есть
+    # у основного туннеля, а push'и нумерации («route 10.0.0.0/8») применяются как есть.
+    # keepalive мягче, чем у основного: корпоративный сервер может не отвечать на PING,
+    # а перезапуск по --ping-restart 12 поднимал вторую сессию и ронял первую.
     openvpn --cd "$_dir" --config "$_conf" --dev "$_dev" --dev-type tun \
-            $_extra --log "$DATA/ovpn.log" --writepid "$STATE/ovpnx.$_id.pid" --daemon \
-            --script-security 2 --ping 5 --ping-restart 12 --explicit-exit-notify 1 \
+            $_extra --log "$DATA/aux-$_id.log" --writepid "$STATE/ovpnx.$_id.pid" --daemon \
+            --script-security 2 --ping 15 --ping-restart 120 --explicit-exit-notify 1 \
             --pull-filter ignore "ping-restart" --pull-filter ignore "ping" \
             --pull-filter ignore "redirect-gateway" --pull-filter ignore "dhcp-option" \
             2>>"$DATA/ovpn.log" \
@@ -340,9 +345,11 @@ aux_ovpn_up() {
         sleep 1; _i=$((_i+1))
     done
     if [ -z "$(aux_ip "$_dev")" ]; then
-        case "$(tail -3 "$DATA/ovpn.log" 2>/dev/null)" in
+        case "$(tail -5 "$DATA/aux-$_id.log" 2>/dev/null)" in
             *"Private Key Password"*|*"neither stdin nor stderr are a tty"*)
                 set_warn "ключ профиля $_id защищён паролем — задай его кнопкой с ключом на карточке профиля" ;;
+            *"is already active"*)
+                set_warn "сервер пускает только один сеанс на этого пользователя: сеанс ещё занят прошлым подключением ($_id)" ;;
             *) set_warn "доп. туннель $_id не получил адрес (сервер недоступен или ошибка в профиле)" ;;
         esac
         return 1
@@ -849,12 +856,6 @@ watch() {
         for _a in $(aux_list 2>/dev/null); do
             [ -n "$_a" ] || continue
             aux_alive "$_a" && continue
-            _try=$(cat "$STATE/aux_try.$_a" 2>/dev/null || echo 0)
-            _age=$(( $(date +%s) - ${_try:-0} ))
-            if [ "$_age" -lt 90 ]; then
-                log "watch: доп. туннель $_a не поднят, прошло ${_age}с — жду кулдаун 90 с"
-                continue
-            fi
             log "watch: доп. туннель $_a пропал — поднимаю"
             aux_up "$_a" || true
         done

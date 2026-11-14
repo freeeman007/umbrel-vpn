@@ -20,7 +20,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import urllib.request
 from urllib.parse import urlparse, parse_qs
 
-VERSION = "3.7.2"
+VERSION = "3.7.4"
 DATA = os.environ.get("DATA", "/data")
 PORT = int(os.environ.get("APP_PORT", "8666"))
 NET_SH = os.path.join(DATA, "net.sh")
@@ -996,7 +996,8 @@ display:flex;align-items:center;gap:7px}
 background:#161a21;margin-bottom:8px;cursor:pointer;transition:border-color .15s}
 .prof:hover{border-color:#33405a}
 .prof.sel{border-color:#3ddc84;background:#132219}
-.prof.aux{border-color:#2e4a3a}
+.prof.aux{border-color:#3b7ea8;background:#101c25}
+.prof.aux .dot{background:#4aa8ff;box-shadow:0 0 8px #4aa8ff}
 .ico.on{color:#3ddc84;border-color:#2f5340;background:#14261b}
 .pick{display:flex;align-items:center;gap:9px;padding:8px 10px;border-radius:9px;border:1px solid #232936;
 background:#12161d;margin-bottom:6px;font-size:13px;cursor:pointer}
@@ -1012,6 +1013,7 @@ background:#12161d;margin-bottom:6px;font-size:13px;cursor:pointer}
 .badge.bad{background:#331c1c;color:#e08585}
 .dot{width:9px;height:9px;border-radius:50%;background:#2f3746;flex:0 0 9px}
 .prof.sel .dot{background:#3ddc84;box-shadow:0 0 8px #3ddc84}
+.prof.aux .pname:after{content:" · доп. туннель";font-size:11px;color:#6fb2e0;font-weight:400}
 .pname{font-weight:600;font-size:14px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .pmeta{font-size:12px;color:#7d8698;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .acts{margin-left:auto;display:flex;gap:6px;flex:0 0 auto}
@@ -1258,7 +1260,7 @@ function render(){
     let meta=(x.full_tunnel?'весь трафик · ':'')+
       (x.remotes&&x.remotes.length?x.remotes[0]+' ':'')+
       (x.missing&&x.missing.length?'нет файлов: '+x.missing.join(','):'');
-    if(ax) meta=(ax.up?'доп. туннель '+ax.ip+' · ':'доп. туннель (поднимается) · ')+meta;
+    if(ax) meta=(ax.up?ax.ip+' · ':'подключается… · ')+meta;
     const key=x.type!=='openvpn'?'':'<button class="ico'+(x.has_pass?' on':'')+'" data-act="key" title="'+
       (x.has_pass?'Пароль ключа задан — можно изменить или стереть':'Ключ профиля под паролем — задать пароль')+'">&#128273;</button>';
     const plus=(x.full_tunnel||sel)?'':'<button class="ico'+(ax?' on':'')+'" data-act="aux" title="'+
@@ -1267,7 +1269,7 @@ function render(){
     return '<div class="prof'+(sel?' sel':'')+(ax?' aux':'')+'" data-id="'+esc(x.id)+'">'+
       '<span class="dot"></span><div style="min-width:0"><div class="pname">'+esc(x.name)+'</div>'+
       '<div class="pmeta">'+esc(meta)+'</div></div>'+
-      '<div class="acts"><button class="ico" data-act="go" title="Подключить основным">▶</button>'+key+plus+
+      '<div class="acts"><button class="ico" data-act="go" title="Подключить основным">▶</button>'+plus+key+
       '<button class="ico" data-act="del" title="Удалить">✕</button></div></div>';
   }
   function paintProfiles(boxId, arr, empty){
@@ -1630,8 +1632,9 @@ class Handler(BaseHTTPRequestHandler):
         if u.path == "/api/diag":
             script = ("sh %s status 2>&1; echo '--- tun ---'; ls -l /dev/net/tun 2>&1; "
                       "echo '--- ovpn.log ---'; tail -16 %s/ovpn.log 2>&1; "
+                      "echo '--- aux logs ---'; tail -12 %s/aux-*.log 2>&1; "
                       "echo '--- net.log ---'; tail -10 %s/net.log 2>&1; "
-                      "echo '--- ip route ---'; ip -4 route 2>&1 | head -80" % (NET_SH, DATA, DATA))
+                      "echo '--- ip route ---'; ip -4 route 2>&1 | head -80"% (NET_SH, DATA, DATA, DATA))
             return self._send(200, json.dumps({"diag": sh(script, timeout=40)}, ensure_ascii=False))
         if u.path == "/api/profile_text":
             q = parse_qs(u.query)

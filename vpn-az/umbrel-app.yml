@@ -3,7 +3,7 @@ id: vpn-az
 icon: https://raw.githubusercontent.com/freeeman007/umbrel-vpn/main/vpn-az/icon.png
 category: networking
 name: VPN
-version: "3.7.2"
+version: "3.7.4"
 tagline: VPN-клиент с библиотекой профилей и включением в один тап
 description: >-
   Клиент к своему VPN-серверу прямо на Umbrel: библиотека профилей
