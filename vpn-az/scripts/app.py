@@ -19,7 +19,7 @@ import zlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
-VERSION = "3.0.7"
+VERSION = "3.1.0"
 DATA = os.environ.get("DATA", "/data")
 PORT = int(os.environ.get("APP_PORT", "8666"))
 NET_SH = os.path.join(DATA, "net.sh")
@@ -406,6 +406,7 @@ def status():
         },
         "dns": {"port": DNS_PORT, "listening": dns_listening(),
                 "override": os.path.exists(os.path.join(STATE, "dns_on"))},
+        "autostart": os.path.exists(os.path.join(STATE, "autostart")),
         "lan": {"nat": os.path.exists(os.path.join(STATE, "lan_access"))},
         "egress": EGRESS,
         "direct_ok": probe_direct(),
@@ -478,11 +479,15 @@ def boot():
     threading.Thread(target=watch_loop, daemon=True).start()
     time.sleep(2)
     ph = phase()
+    auto = os.path.exists(os.path.join(STATE, "autostart")) and bool(state("active"))
     if ph == "connecting":
         # контейнер упал посреди подключения — не оставляем полутуннель
         net("disconnect", timeout=60)
         write(os.path.join(STATE, "phase"), "failed")
         write(os.path.join(STATE, "error"), "подключение было прервано перезапуском — включи заново")
+    elif auto:
+        # автостарт: поднимаем последний профиль, даже если штатная остановка сняла туннель
+        threading.Thread(target=lambda: do_connect(state("active")), daemon=True).start()
     elif ph == "on" and state("active"):
         threading.Thread(target=lambda: do_connect(state("active")), daemon=True).start()
 
@@ -677,6 +682,7 @@ border-radius:50%;animation:r 1s linear infinite;vertical-align:-2px;margin-righ
 <div class="sec">Сервис</div>
 <div class="card">
   <div class="row"><span class="k">Перехват DNS всех приложений</span><div class="sw" id="swdns" onclick="setOpt('dns')"></div></div>
+  <div class="row"><span class="k">Включать туннель при запуске</span><div class="sw" id="swauto" onclick="setOpt('auto')"></div></div>
   <div class="row"><span class="k">NAT в домашнюю сеть</span><div class="sw" id="swlan" onclick="setOpt('lan')"></div></div>
 </div>
 <button class="ghost" onclick="diag()">Диагностика и журнал</button>
@@ -738,6 +744,7 @@ function render(){
   fld.textContent=t.default_via_tunnel?'да':'нет';
   fld.className='v '+(t.default_via_tunnel?'ok':'');
   document.getElementById('swdns').className='sw'+(S.dns&&S.dns.override?' on':'');
+  document.getElementById('swauto').className='sw'+(S.autostart?' on':'');
   document.getElementById('swlan').className='sw'+(S.lan&&S.lan.nat?' on':'');
   const box=document.getElementById('profiles'); const list=S.profiles||[];
   if(!list.length){ box.innerHTML='<div class="card" style="color:#7d8698;font-size:13px">Профилей нет. Добавь .ovpn или .conf.</div>'; return; }
@@ -766,7 +773,10 @@ async function pick(id){
   load();
 }
 async function setOpt(what){
-  const on = what==='dns' ? !(S.dns&&S.dns.override) : !(S.lan&&S.lan.nat);
+  let on;
+  if(what==='dns') on=!(S.dns&&S.dns.override);
+  else if(what==='auto') on=!S.autostart;
+  else on=!(S.lan&&S.lan.nat);
   await api('/api/'+what+(on?'_on':'_off'),{method:'POST'});
   load();
 }
@@ -910,6 +920,15 @@ class Handler(BaseHTTPRequestHandler):
         if u.path == "/api/disconnect":
             threading.Thread(target=do_disconnect, daemon=True).start()
             return self._send(200, json.dumps({"ok": True, "phase": "off"}))
+
+        if u.path in ("/api/auto_on", "/api/auto_off"):
+            flag = os.path.join(STATE, "autostart")
+            on = u.path.endswith("_on")
+            if on:
+                write(flag, "1\n")
+            elif os.path.exists(flag):
+                os.remove(flag)
+            return self._send(200, json.dumps({"ok": True, "on": on}))
 
         if u.path in ("/api/dns_on", "/api/dns_off", "/api/lan_on", "/api/lan_off"):
             what = "dns" if "dns" in u.path else "lan"
