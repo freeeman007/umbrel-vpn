@@ -165,6 +165,8 @@ ovpn_start() { # ovpn_start <id>
 
     _extra=""
     [ -f "$_dir/cred.txt" ] && _extra="--auth-user-pass $_dir/cred.txt"
+    # ключ может быть зашифрован: пароль лежит в pass.txt (0600), задаётся из панели
+    [ -f "$_dir/pass.txt" ] && _extra="$_extra --askpass $_dir/pass.txt"
 
     # --cd важен: сторонние провайдеры ссылаются на ca.crt/key из той же папки
     # --ping 5/--ping-restart 12 + игнор серверных ping-опций: первая сессия к этому
@@ -185,7 +187,11 @@ ovpn_start() { # ovpn_start <id>
         sleep 1; _i=$((_i+1))
     done
     if [ -z "$(tun_ip)" ]; then
-        set_error "туннель не получил адрес (ошибка в профиле или сервер недоступен)"
+        case "$(tail -3 "$DATA/ovpn.log" 2>/dev/null)" in
+            *"Private Key Password"*|*"neither stdin nor stderr are a tty"*)
+                set_error "ключ профиля защищён паролем — задай его кнопкой с ключом на карточке профиля" ;;
+            *) set_error "туннель не получил адрес (ошибка в профиле или сервер недоступен)" ;;
+        esac
         return 1
     fi
     rule_ensure mangle POSTROUTING -o "$OVPN_DEV" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
@@ -318,6 +324,7 @@ aux_ovpn_up() {
     _def0=$(ip -4 route show default | head -1)
     _extra=""
     [ -f "$_dir/cred.txt" ] && _extra="--auth-user-pass $_dir/cred.txt"
+    [ -f "$_dir/pass.txt" ] && _extra="$_extra --askpass $_dir/pass.txt"
     # redirect-gateway и dhcp-option от сервера отбрасываем: default и DNS остаются
     # у основного туннеля, а push'и нумерации («route 10.0.0.0/8») применяются как есть
     openvpn --cd "$_dir" --config "$_conf" --dev "$_dev" --dev-type tun \
@@ -332,7 +339,14 @@ aux_ovpn_up() {
         [ -n "$(aux_ip "$_dev")" ] && break
         sleep 1; _i=$((_i+1))
     done
-    [ -n "$(aux_ip "$_dev")" ] || { set_warn "доп. туннель $_id не получил адрес (сервер недоступен или ошибка в профиле)"; return 1; }
+    if [ -z "$(aux_ip "$_dev")" ]; then
+        case "$(tail -3 "$DATA/ovpn.log" 2>/dev/null)" in
+            *"Private Key Password"*|*"neither stdin nor stderr are a tty"*)
+                set_warn "ключ профиля $_id защищён паролем — задай его кнопкой с ключом на карточке профиля" ;;
+            *) set_warn "доп. туннель $_id не получил адрес (сервер недоступен или ошибка в профиле)" ;;
+        esac
+        return 1
+    fi
     rule_ensure mangle POSTROUTING -o "$_dev" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
     rule_ensure mangle OUTPUT -o "$_dev" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
     protect_lan

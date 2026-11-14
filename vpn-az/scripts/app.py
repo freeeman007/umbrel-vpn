@@ -20,7 +20,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import urllib.request
 from urllib.parse import urlparse, parse_qs
 
-VERSION = "3.6.0"
+VERSION = "3.6.1"
 DATA = os.environ.get("DATA", "/data")
 PORT = int(os.environ.get("APP_PORT", "8666"))
 NET_SH = os.path.join(DATA, "net.sh")
@@ -192,6 +192,7 @@ def profile(pid):
         "remotes": meta["remotes"],
         "full_tunnel": meta["full_tunnel"],
         "has_creds": os.path.exists(os.path.join(d, "cred.txt")),
+        "has_pass": os.path.exists(os.path.join(d, "pass.txt")),
         "awg": bool(meta.get("awg")),
         "files": [f for f in files if f != "profile.json"],
         "missing": [f for f in meta["external_files"] if not os.path.exists(os.path.join(d, f))],
@@ -210,7 +211,7 @@ def save_profile(pid, name, ptype):
           json.dumps({"name": name, "type": ptype, "created": int(time.time())}, ensure_ascii=False))
 
 
-def import_files(files, name="", user="", password="***", expect=None):
+def import_files(files, name="", user="", password="***", expect=None, keypass=""):
     """files: список (filename, bytes). Возвращает (id, warnings)."""
     cfg = None
     extras = []
@@ -260,6 +261,15 @@ def import_files(files, name="", user="", password="***", expect=None):
         except OSError:
             pass
 
+    if is_ovpn and keypass:
+        pf = os.path.join(d, "pass.txt")
+        with open(pf, "w") as f:
+            f.write(keypass.strip() + "\n")
+        try:
+            os.chmod(pf, 0o600)
+        except OSError:
+            pass
+        warnings.append("пароль ключа сохранён в данных профиля")
     pj = {"name": base_name, "type": "openvpn" if is_ovpn else "wireguard", "created": int(time.time())}
     write(os.path.join(d, "profile.json"), json.dumps(pj, ensure_ascii=False))
 
@@ -277,7 +287,7 @@ def import_files(files, name="", user="", password="***", expect=None):
     return pid, warnings
 
 
-def import_any(body, ctype, query, expect=None):
+def import_any(body, ctype, query, expect=None, keypass=""):
     """Разбирает multipart / zip / сырой текст. Возвращает (id, warnings)."""
     name = (query.get("name") or [""])[0]
     user = (query.get("user") or [""])[0]
@@ -293,7 +303,7 @@ def import_any(body, ctype, query, expect=None):
             if not inner or inner.startswith("."):
                 continue
             files.append((inner, zf.read(info)))
-        return import_files(files, name, user, pwd, expect=expect)
+        return import_files(files, name, user, pwd, expect=expect, keypass=keypass)
 
     if "multipart/form-data" in (ctype or ""):
         m = re.search(r"boundary=([^;]+)", ctype)
@@ -322,7 +332,8 @@ def import_any(body, ctype, query, expect=None):
         user = user or fields.get("user", "")
         pwd = pwd or fields.get("pass", "")
         expect = expect or fields.get("expect") or None
-        return import_files(files, name, user, pwd, expect=expect)
+        keypass = keypass or fields.get("keypass") or ""
+        return import_files(files, name, user, pwd, expect=expect, keypass=keypass)
 
     text = body.decode("utf-8", "replace")
     if text.startswith("conf="):
@@ -330,7 +341,8 @@ def import_any(body, ctype, query, expect=None):
     if not text.strip():
         raise ValueError("пустой профиль")
     ext = ".conf" if "[Interface]" in text and "PrivateKey" in text else ".ovpn"
-    return import_files([("profile" + ext, text.encode())], name, user, pwd, expect=expect)
+    return import_files([("profile" + ext, text.encode())], name, user, pwd, expect=expect,
+                        keypass=keypass)
 
 
 # ----------------------------------------------------------------- сеть/статус
@@ -1073,11 +1085,24 @@ transition:opacity .13s ease,transform .13s ease,visibility .13s}
   <label>Логин/пароль, если провайдер их требует</label>
   <input type="text" id="u" placeholder="логин (необязательно)" autocomplete="off">
   <input type="password" id="p" placeholder="пароль (необязательно)" autocomplete="new-password">
+  <label>Пароль ключа, если ключ зашифрован (OpenVPN)</label>
+  <input type="password" id="kp" placeholder="пароль ключа (необязательно)" autocomplete="off">
   <label>Название профиля</label>
   <input type="text" id="nm" placeholder="например: KZ полный туннель">
   <button class="primary" onclick="doImport()">Добавить</button>
   <button class="ghost" style="margin-top:8px" onclick="document.getElementById('imp').close()">Отмена</button>
   <pre id="impout"></pre>
+</dialog>
+
+<dialog id="kpd">
+  <h2>Пароль ключа</h2>
+  <div class="hint" style="margin:0 0 10px">Ключ в этом профиле зашифрован. Пароль хранится в
+  данных профиля (файл только для владельца) и в чат не попадает.</div>
+  <input type="password" id="kppass" autocomplete="off" placeholder="пароль ключа">
+  <button class="primary" onclick="kpSave()">Сохранить</button>
+  <button class="ghost" style="margin-top:8px" onclick="kpClear()">Стереть пароль</button>
+  <button class="ghost" style="margin-top:8px" onclick="document.getElementById('kpd').close()">Отмена</button>
+  <pre id="kpout"></pre>
 </dialog>
 
 <dialog id="tgdlg">
@@ -1160,13 +1185,15 @@ function render(){
       (x.remotes&&x.remotes.length?x.remotes[0]+' ':'')+
       (x.missing&&x.missing.length?'нет файлов: '+x.missing.join(','):'');
     if(ax) meta=(ax.up?'доп. туннель '+ax.ip+' · ':'доп. туннель (поднимается) · ')+meta;
+    const key=x.type!=='openvpn'?'':'<button class="ico'+(x.has_pass?' on':'')+'" data-act="key" title="'+
+      (x.has_pass?'Пароль ключа задан — можно изменить или стереть':'Ключ профиля под паролем — задать пароль')+'">&#128273;</button>';
     const plus=(x.full_tunnel||sel)?'':'<button class="ico'+(ax?' on':'')+'" data-act="aux" title="'+
       (ax?'Отключить доп. туннель':'Подключить как доп.: в него уйдут только его сети, интернет останется у основного')+
       '">'+(ax?'−':'+')+'</button>';
     return '<div class="prof'+(sel?' sel':'')+(ax?' aux':'')+'" data-id="'+esc(x.id)+'">'+
       '<span class="dot"></span><div style="min-width:0"><div class="pname">'+esc(x.name)+'</div>'+
       '<div class="pmeta">'+esc(meta)+'</div></div>'+
-      '<div class="acts">'+plus+'<button class="ico" data-act="ren" title="Переименовать">✎</button>'+
+      '<div class="acts">'+key+plus+'<button class="ico" data-act="ren" title="Переименовать">✎</button>'+
       '<button class="ico" data-act="del" title="Удалить">✕</button></div></div>';
   }
   function paintProfiles(boxId, arr, empty){
@@ -1181,6 +1208,8 @@ function render(){
         e.stopPropagation(); askRename(id,(pr&&pr.name)||''); });
       el.querySelector('[data-act="del"]').addEventListener('click',function(e){
         e.stopPropagation(); del(id); });
+      const kb=el.querySelector('[data-act="key"]');
+      if(kb) kb.addEventListener('click',function(e){ e.stopPropagation(); keyPass(id,(pr&&pr.has_pass)); });
       const ab=el.querySelector('[data-act="aux"]');
       if(ab) ab.addEventListener('click',function(e){
         e.stopPropagation();
@@ -1239,6 +1268,23 @@ async function tgSave(){
     load();
   } else o.textContent='не сохранилось: '+((r&&r.error)||'нет ответа');
 }
+let KPID='';
+function keyPass(id,has){
+  KPID=id;
+  document.getElementById('kppass').value='';
+  document.getElementById('kpout').textContent=has?'пароль уже задан':'пароль не задан';
+  document.getElementById('kpd').showModal();
+}
+async function kpSend(pw){
+  const o=document.getElementById('kpout'); o.textContent='…';
+  const r=await api('/api/keypass',{method:'POST',headers:{'Content-Type':'application/json'},
+                                    body:JSON.stringify({id:KPID,pass:pw})});
+  if(r&&r.ok){ o.textContent=pw?'сохранено':'пароль стёрт';
+    setTimeout(function(){document.getElementById('kpd').close();},600); load(); }
+  else o.textContent='не сохранилось: '+((r&&r.error)||'нет ответа');
+}
+function kpSave(){ kpSend(document.getElementById('kppass').value.trim()); }
+function kpClear(){ kpSend(''); }
 async function tgTest(){
   const r=await api('/api/tg_test',{method:'POST'});
   if(r&&r.ok) alert('Сообщение отправлено');
@@ -1273,6 +1319,7 @@ function openImport(proto){
   document.getElementById('nm').value='';
   document.getElementById('u').value='';
   document.getElementById('p').value='';
+  document.getElementById('kp').value='';
   document.getElementById('impout').textContent='';
   document.getElementById('imp').showModal();
 }
@@ -1284,6 +1331,7 @@ async function doImport(){
   const txt=document.getElementById('conftext').value.trim();
   if(txt) fd.append('config',new Blob([txt],{type:'text/plain'}), txt.indexOf('[Interface]')>=0?'profile.conf':'profile.ovpn');
   fd.append('expect',IMPPROTO);
+  fd.append('keypass',document.getElementById('kp').value);
   fd.append('name',document.getElementById('nm').value.trim());
   fd.append('user',document.getElementById('u').value);
   fd.append('pass',document.getElementById('p').value);
@@ -1401,7 +1449,8 @@ class Handler(BaseHTTPRequestHandler):
         if u.path == "/api/import":
             try:
                 pid, warnings = import_any(body, self.headers.get("Content-Type", ""), q,
-                                              expect=(q.get("expect") or [""])[0] or None)
+                                              expect=(q.get("expect") or [""])[0] or None,
+                                              keypass=(q.get("keypass") or [""])[0])
             except Exception as e:  # noqa: BLE001
                 return self._send(400, json.dumps({"error": str(e)}, ensure_ascii=False))
             return self._send(200, json.dumps({"ok": True, "profile": profile(pid),
@@ -1418,6 +1467,26 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(404, json.dumps({"error": "нет такого профиля"}))
             threading.Thread(target=do_connect, args=(pid,), daemon=True).start()
             return self._send(200, json.dumps({"ok": True, "phase": "connecting"}))
+
+        if u.path == "/api/keypass":
+            try:
+                o = json.loads(body.decode() or "{}")
+            except Exception:  # noqa: BLE001
+                o = {}
+            pid = str(o.get("id") or "")
+            if not profile(pid):
+                return self._send(404, json.dumps({"error": "нет такого профиля"}))
+            pf = os.path.join(profile_dir(pid), "pass.txt")
+            pw = str(o.get("pass") or "")
+            if pw:
+                write(pf, pw + "\n")
+                try:
+                    os.chmod(pf, 0o600)
+                except OSError:
+                    pass
+            elif os.path.exists(pf):
+                os.remove(pf)
+            return self._send(200, json.dumps({"ok": True, "has_pass": bool(pw)}))
 
         if u.path in ("/api/aux_on", "/api/aux_off"):
             pid = (q.get("id") or [""])[0]
