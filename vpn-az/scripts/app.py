@@ -17,9 +17,10 @@ import time
 import zipfile
 import zlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import urllib.request
 from urllib.parse import urlparse, parse_qs
 
-VERSION = "3.4.2"
+VERSION = "3.4.3"
 DATA = os.environ.get("DATA", "/data")
 PORT = int(os.environ.get("APP_PORT", "8666"))
 NET_SH = os.path.join(DATA, "net.sh")
@@ -468,6 +469,10 @@ def status():
         "lan": {"nat": os.path.exists(os.path.join(STATE, "lan_access"))},
         "egress": EGRESS,
         "direct_ok": probe_direct(),
+        "tg": {"enabled": tg_enabled(), "configured": bool(tg_conf().get("token")),
+               "at": _tg_sent_at(), "error": state("tg_error"),
+               "chat_id": str(tg_conf().get("chat_id") or ""),
+               "thread_id": str(tg_conf().get("thread_id") or "")},
     }
     return st
 
@@ -501,6 +506,129 @@ def check_url(url, via=""):
             "time": round(float(parts[1]), 2), "ip": parts[2]}
 
 
+# ------------------------------------------------------------- telegram
+# Сообщение в Telegram о том, какие адреса получил сервер: туннельный (по нему
+# заходишь с телефона), LAN (в новом месте он каждый раз разный) и внешний.
+# Токен и chat_id лежат в /data/telegram.json (0600) — в репозиторий не попадают.
+TG_CONF = os.path.join(DATA, "telegram.json")
+TG_ON = os.path.join(STATE, "tg_on")
+TG_SENT = os.path.join(STATE, "tg_sent.json")
+TG_LOCK = threading.Lock()
+
+
+def tg_conf():
+    try:
+        c = json.loads(read(TG_CONF, "") or "{}")
+    except Exception:  # noqa: BLE001
+        return {}
+    return c if isinstance(c, dict) else {}
+
+
+def tg_enabled():
+    return bool(tg_conf().get("token")) and os.path.exists(TG_ON)
+
+
+def lan_addrs():
+    """Адреса локальной сети: интерфейсы туннеля, docker и bridges не в счёт."""
+    out = run(["ip", "-4", "-o", "addr", "show", "scope", "global"])
+    res = []
+    for line in (out or "").splitlines():
+        f = line.split()
+        if len(f) < 4:
+            continue
+        iface, cidr = f[1], f[3]
+        if iface == "lo" or iface.startswith(("azvpn", "tun", "wg", "docker", "br-", "veth", "tap",
+                                             "umbrel-vm", "kube", "lxc")):
+            continue
+        res.append("%s (%s)" % (cidr, iface))
+    return res
+
+
+def tg_send(text):
+    c = tg_conf()
+    if not c.get("token") or not c.get("chat_id"):
+        return False, "нет token/chat_id в %s" % TG_CONF
+    body = {"chat_id": str(c["chat_id"]), "text": text, "disable_web_page_preview": True}
+    if c.get("thread_id"):
+        try:
+            body["message_thread_id"] = int(c["thread_id"])
+        except (TypeError, ValueError):
+            pass
+    try:
+        req = urllib.request.Request(
+            "https://api.telegram.org/bot%s/sendMessage" % c["token"],
+            data=json.dumps(body).encode(), headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=20) as r:
+            j = json.loads(r.read().decode("utf-8", "replace"))
+        return bool(j.get("ok")), (j.get("description") or "")
+    except Exception as e:  # noqa: BLE001
+        return False, str(e)
+
+
+def tg_text(reason):
+    st = status()
+    tun = st.get("tunnel") or {}
+    ip = tun.get("ip") or "—"
+    lan = ", ".join(lan_addrs()) or "—"
+    eg = (st.get("egress") or {}).get("tunnel") or "—"
+    prof = (st.get("active") or {}).get("name") or st.get("active_id") or "—"
+    mode = "весь трафик" if tun.get("default_via_tunnel") else "split"
+    lines = [
+        "VPN AZ · Umbrel — %s" % reason,
+        "профиль: %s (%s)" % (prof, mode),
+        "адрес в туннеле: %s" % ip,
+        "LAN: %s" % lan,
+        "выход в интернет: %s" % eg,
+        "дашборд: http://%s/" % ip,
+        "панель: http://%s:8666/" % ip,
+    ]
+    return "\n".join(lines), "%s|%s|%s|%s" % (ip, lan, eg, prof)
+
+
+def tg_report(reason="подключено", force=False):
+    """Отправить адреса в Telegram. Одинаковый набор адресов дважды не шлём."""
+    if not tg_enabled():
+        return
+    if not TG_LOCK.acquire(blocking=False):
+        return
+    try:
+        text, key = tg_text(reason)
+        try:
+            prev = json.loads(read(TG_SENT, "") or "{}")
+        except Exception:  # noqa: BLE001
+            prev = {}
+        if not force and prev.get("key") == key:
+            return
+        ok, err = tg_send(text)
+        if ok:
+            write(TG_SENT, json.dumps({"key": key, "at": int(time.time())}, ensure_ascii=False))
+        else:
+            write(os.path.join(STATE, "tg_error"), err or "ошибка отправки")
+    finally:
+        TG_LOCK.release()
+
+
+def _tg_sent_at():
+    try:
+        return int((json.loads(read(TG_SENT, "") or "{}") or {}).get("at") or 0)
+    except Exception:  # noqa: BLE001
+        return 0
+
+
+def tg_report_later(reason, delay=3.0):
+    def _run():
+        time.sleep(delay)
+        try:
+            # после подключения проба внешнего IP могла не успеть пересчитаться —
+            # иначе в сообщении окажется адрес, снятый до подъёма туннеля
+            if int(EGRESS.get("at") or 0) < time.time() - 45:
+                egress_once()
+            tg_report(reason)
+        except Exception:  # noqa: BLE001
+            pass
+    threading.Thread(target=_run, daemon=True).start()
+
+
 def do_connect(pid):
     if not CONN_LOCK.acquire(blocking=False):
         return False
@@ -512,6 +640,8 @@ def do_connect(pid):
         write(os.path.join(STATE, "active"), pid)
         write(os.path.join(STATE, "phase"), "connecting")
         net("connect", pid, timeout=240)
+        if phase() == "on":
+            tg_report_later("подключено")
         return phase() == "on"
     finally:
         CONN_LOCK.release()
@@ -555,6 +685,15 @@ def boot():
         def _resume():
             net("resume", _pid, timeout=300)
             EGRESS_WAKE.set()
+            if phase() == "on":
+                tg_report_later("сервер запущен, туннель поднят", delay=4)
+            elif tg_enabled():
+                # о неудаче молчать нельзя: узнать о ней иначе можно только на месте
+                _err = state("error") or phase()
+                if read(os.path.join(STATE, "tg_fail")) != _err:
+                    write(os.path.join(STATE, "tg_fail"), _err)
+                    tg_send("VPN AZ · Umbrel — туннель не поднялся\nстатус: %s\nLAN: %s"
+                            % (_err, ", ".join(lan_addrs()) or "—"))
 
         threading.Thread(target=_resume, daemon=True).start()
     elif ph == "connecting":
@@ -716,6 +855,9 @@ font-size:12px;cursor:pointer}
 .sw.on{background:#1e5f3f}.sw.on:after{left:21px;background:#3ddc84}
 button.primary{width:100%;background:#3ddc84;color:#08110c;border:0;border-radius:12px;padding:13px;
 font-size:15px;font-weight:600;cursor:pointer;margin-top:4px}
+button.mini{background:#1a1f29;border:1px solid #2b3344;color:#8b93a1;border-radius:9px;
+width:30px;height:30px;font-size:14px;line-height:1;cursor:pointer;padding:0}
+button.mini:hover{color:#3ddc84;border-color:#2f4a3b}
 button.ghost{width:100%;background:#1a1f29;color:#c7cede;border:1px solid #2b3344;border-radius:12px;
 padding:12px;font-size:14px;cursor:pointer}
 dialog{border:0;border-radius:16px;background:#141821;color:#e8ecf1;padding:18px;width:min(560px,94vw)}
@@ -777,10 +919,12 @@ transition:opacity .13s ease,transform .13s ease,visibility .13s}
 <div class="card">
   <div class="row"><span class="k kw"><span>Перехват DNS всех приложений</span><span class="q" tabindex="0" role="button" aria-label="Пояснение: перехват DNS" data-tip="Все запросы на порт 53 (UDP и TCP) от приложений Umbrel уходят в локальный резолвер Umbrel, а он спрашивает 1.1.1.1 напрямую, мимо туннеля. Спасает, когда VPN-сервер перехватывает DNS и отдаёт адреса, по которым ничего не открывается. DoH/DoT (порты 443 и 853) не трогает.">?</span></span><div class="sw" id="swdns" onclick="setOpt('dns')"></div></div>
   <div class="row"><span class="k kw"><span>Автоподключение при старте</span><span class="q" tabindex="0" role="button" aria-label="Пояснение: автоподключение при старте" data-tip="Поднимать выбранный профиль сам после перезагрузки Umbrel или перезапуска приложения. Туннель, выключенный вручную, сам не включится.">?</span></span><div class="sw" id="swauto" onclick="setOpt('auto')"></div></div>
-  <div class="row"><span class="k kw"><span>NAT в домашнюю сеть</span><span class="q" tabindex="0" role="button" aria-label="Пояснение: NAT в домашнюю сеть" data-tip="Пускать клиентов VPN (10.28.0.0/22) в домашнюю сеть 192.168.11.0/24 через этот Umbrel: ноутбук в VPN увидит NAS, принтер, веб-морду роутера.">?</span></span><div class="sw" id="swlan" onclick="setOpt('lan')"></div></div>
+  <div class="row"><span class="k kw"><span>NAT в домашнюю сеть</span><span class="q" tabindex="0" role="button" aria-label="Пояснение: NAT в домашнюю сеть" data-tip="Маскарад для клиентов VPN в локальную сеть этого Umbrel: телефон из VPN сможет зайти на NAS, принтер, веб-морду роутера. Маршрут к локальной подсети клиент должен знать сам — серверный пуш 192.168.11.0/24 убран, потому что при переезде подсеть меняется. Актуальная подсеть приходит в сообщении Telegram (строка LAN).">?</span></span><div class="sw" id="swlan" onclick="setOpt('lan')"></div></div>
+  <div class="row"><span class="k kw"><span>Уведомления в Telegram</span><span class="q" tabindex="0" role="button" aria-label="Пояснение: уведомления в Telegram" data-tip="После подключения и после запуска сервера присылает в Telegram адрес в туннеле, LAN-адрес и внешний IP — по ним видно, куда заходить с телефона. Одинаковые адреса дважды не отправляются.">?</span></span><span style="display:flex;align-items:center;gap:10px"><button class="mini" title="Настройки уведомлений" onclick="tgSetup()">&#9881;</button><div class="sw" id="swtg" onclick="setOpt('tg')"></div></span></div>
 </div>
 <div class="hint bad" id="warn" style="display:none"></div>
 <button class="ghost" onclick="diag()">Диагностика и журнал</button>
+<button class="ghost" onclick="tgTest()">Проверить уведомление</button>
 
 <dialog id="imp">
   <h2>Новый профиль</h2>
@@ -796,6 +940,19 @@ transition:opacity .13s ease,transform .13s ease,visibility .13s}
   <button class="primary" onclick="doImport()">Добавить</button>
   <button class="ghost" style="margin-top:8px" onclick="document.getElementById('imp').close()">Отмена</button>
   <pre id="impout"></pre>
+</dialog>
+
+<dialog id="tgdlg">
+  <h2>Уведомления в Telegram</h2>
+  <label>Токен бота (оставь пустым, чтобы не менять)</label>
+  <input type="password" id="tgtoken" autocomplete="off" placeholder="123456:AA…">
+  <label>chat_id</label>
+  <input type="text" id="tgchat" placeholder="49923888 или -1001234567890">
+  <label>ID темы в чате (необязательно)</label>
+  <input type="text" id="tgthread" placeholder="например 552407">
+  <button class="primary" onclick="tgSave()">Сохранить</button>
+  <button class="ghost" style="margin-top:8px" onclick="document.getElementById('tgdlg').close()">Отмена</button>
+  <pre id="tgout"></pre>
 </dialog>
 
 <dialog id="dlg"><h2 id="dlgt">Журнал</h2><pre id="diagout">загрузка…</pre>
@@ -856,6 +1013,7 @@ function render(){
   document.getElementById('swdns').className='sw'+(S.dns&&S.dns.override?' on':'');
   document.getElementById('swauto').className='sw'+(S.autostart?' on':'');
   document.getElementById('swlan').className='sw'+(S.lan&&S.lan.nat?' on':'');
+  document.getElementById('swtg').className='sw'+(S.tg&&S.tg.enabled?' on':'');
   const box=document.getElementById('profiles'); const list=S.profiles||[];
   if(!list.length){ box.innerHTML='<div class="card" style="color:#7d8698;font-size:13px">Профилей нет. Добавь .ovpn или .conf.</div>'; return; }
   box.innerHTML=list.map(function(x){
@@ -887,9 +1045,37 @@ async function setOpt(what){
   let on;
   if(what==='dns') on=!(S.dns&&S.dns.override);
   else if(what==='auto') on=!S.autostart;
+  else if(what==='tg') on=!(S.tg&&S.tg.enabled);
   else on=!(S.lan&&S.lan.nat);
   const r=await api('/api/'+what+(on?'_on':'_off'),{method:'POST'});
-  if(what==='auto'&&r&&r.ok===false){ alert(r.error||'не удалось включить автоподключение'); }
+  if((what==='auto'||what==='tg')&&r&&r.ok===false){ alert(r.error||'не удалось включить'); }
+  load();
+}
+function tgSetup(){
+  document.getElementById('tgtoken').value='';
+  document.getElementById('tgchat').value=(S.tg&&S.tg.chat_id)||'';
+  document.getElementById('tgthread').value=(S.tg&&S.tg.thread_id)||'';
+  document.getElementById('tgout').textContent=(S.tg&&S.tg.configured)?'уведомления настроены':'токен ещё не задан';
+  document.getElementById('tgdlg').showModal();
+}
+async function tgSave(){
+  const o=document.getElementById('tgout'); o.textContent='…';
+  const body={chat_id:document.getElementById('tgchat').value.trim(),
+              thread_id:document.getElementById('tgthread').value.trim()};
+  const tok=document.getElementById('tgtoken').value.trim();
+  if(tok) body.token=tok;
+  const r=await api('/api/tg_setup',{method:'POST',headers:{'Content-Type':'application/json'},
+                                     body:JSON.stringify(body)});
+  if(r&&r.ok){
+    o.textContent='сохранено';
+    setTimeout(function(){document.getElementById('tgdlg').close();},700);
+    load();
+  } else o.textContent='не сохранилось: '+((r&&r.error)||'нет ответа');
+}
+async function tgTest(){
+  const r=await api('/api/tg_test',{method:'POST'});
+  if(r&&r.ok) alert('Сообщение отправлено');
+  else alert('Не удалось отправить: '+((r&&r.error)||'нет ответа'));
   load();
 }
 async function refreshIp(){
@@ -1078,6 +1264,63 @@ class Handler(BaseHTTPRequestHandler):
             # занимать до 20 с, а панель опрашивает статус каждые 3 с
             threading.Thread(target=egress_once, daemon=True).start()
             return self._send(200, json.dumps({"ok": True, "egress": EGRESS}, ensure_ascii=False))
+
+        if u.path in ("/api/tg_on", "/api/tg_off"):
+            on = u.path.endswith("_on")
+            if on:
+                if not tg_conf().get("token"):
+                    return self._send(400, json.dumps(
+                        {"ok": False, "error": "уведомления не настроены: нет %s" % TG_CONF},
+                        ensure_ascii=False))
+                write(TG_ON, "1\n")
+                tg_report_later("уведомления включены", delay=0.5)
+            elif os.path.exists(TG_ON):
+                os.remove(TG_ON)
+            return self._send(200, json.dumps({"ok": True, "on": on}))
+
+        if u.path == "/api/tg_setup":
+            try:
+                d = json.loads(body.decode() or "{}")
+            except Exception:  # noqa: BLE001
+                d = {}
+            if not isinstance(d, dict):
+                d = {}
+            c = tg_conf()
+            tok = (d.get("token") or "").strip()
+            if tok:
+                c["token"] = tok
+            cid = str(d.get("chat_id") or "").strip()
+            if cid:
+                c["chat_id"] = cid
+            if "thread_id" in d:
+                tid = str(d.get("thread_id") or "").strip()
+                if tid:
+                    c["thread_id"] = tid
+                else:
+                    c.pop("thread_id", None)
+            if not c.get("token") or not c.get("chat_id"):
+                return self._send(400, json.dumps(
+                    {"ok": False, "error": "нужны токен бота и chat_id"}, ensure_ascii=False))
+            try:
+                os.makedirs(os.path.dirname(TG_CONF), exist_ok=True)
+                fd = os.open(TG_CONF, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+                with os.fdopen(fd, "w") as fh:
+                    json.dump(c, fh)
+                os.chmod(TG_CONF, 0o600)
+            except Exception as e:  # noqa: BLE001
+                return self._send(500, json.dumps({"ok": False, "error": str(e)}, ensure_ascii=False))
+            return self._send(200, json.dumps({"ok": True, "chat_id": c["chat_id"],
+                                               "thread_id": c.get("thread_id", "")}, ensure_ascii=False))
+
+        if u.path == "/api/tg_test":
+            if not tg_conf().get("token"):
+                return self._send(400, json.dumps(
+                    {"ok": False, "error": "уведомления не настроены: нет %s" % TG_CONF},
+                    ensure_ascii=False))
+            _txt, _ = tg_text("проверка связи")
+            _ok, _err = tg_send(_txt)
+            return self._send(200 if _ok else 502,
+                              json.dumps({"ok": _ok, "error": _err}, ensure_ascii=False))
 
         if u.path in ("/api/dns_on", "/api/dns_off", "/api/lan_on", "/api/lan_off"):
             what = "dns" if "dns" in u.path else "lan"
