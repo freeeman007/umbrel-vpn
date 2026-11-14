@@ -284,7 +284,10 @@ dev_aux() { # dev_aux <id> <type>
     [ -n "$_s" ] || _s="x"
     if [ "$2" = wg ]; then printf 'wg%s' "$_s" ; else printf 'azp%s' "$_s" ; fi
 }
-aux_list()  { [ -f "$STATE/aux" ] && grep -v '^[[:space:]]*$' "$STATE/aux" ; }
+# в списке допустимы только id профилей; строки с пробелами/слэшами (мусор от гонок
+# записи) игнорируем — иначе сторож пытался «поднять» адрес вида «192.168.11.126 24»
+aux_list()  { [ -f "$STATE/aux" ] \
+              && sed -n 's/^[[:space:]]*//; s/[[:space:]]*$//; /^[A-Za-z0-9._-][A-Za-z0-9._-]*$/p' "$STATE/aux" ; }
 aux_has()   { aux_list 2>/dev/null | grep -Fqx "$1" ; }
 aux_add()   { mkdir -p "$STATE"; aux_has "$1" || printf '%s\n' "$1" >> "$STATE/aux" ; }
 aux_del()   { mkdir -p "$STATE"; aux_list 2>/dev/null | grep -Fvx "$1" > "$STATE/aux.tmp"; \
@@ -755,7 +758,8 @@ connect() {
 }
 
 disconnect() {
-    aux_all_down
+    # доп. туннели не трогаем: они независимы от основного, у каждого свой выключатель
+    # (карточка «−» или ✕ в блоке доп. туннелей)
     stop_tunnel
     clear_active
     set_phase off
@@ -855,7 +859,9 @@ watch() {
 
     if [ "$_ph" = on ]; then
         ss -lnuH 2>/dev/null | grep -q ":$DNS_PORT " || dns_up || true
-        # доп. туннели: устройство пропало — поднимаем заново (не чаще раза в цикл)
+    fi
+    # доп. туннели независимы от основного: держим их и при выключенном VPN
+    if [ "$_ph" != connecting ]; then
         for _a in $(aux_list 2>/dev/null); do
             [ -n "$_a" ] || continue
             aux_alive "$_a" && continue

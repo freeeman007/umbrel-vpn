@@ -20,7 +20,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import urllib.request
 from urllib.parse import urlparse, parse_qs
 
-VERSION = "3.7.5"
+VERSION = "3.7.6"
 DATA = os.environ.get("DATA", "/data")
 PORT = int(os.environ.get("APP_PORT", "8666"))
 NET_SH = os.path.join(DATA, "net.sh")
@@ -796,9 +796,7 @@ def do_aux(pid, on):
         return
     try:
         if on:
-            if phase() != "on":
-                write(os.path.join(STATE, "warn"), "сначала включи основной туннель — доп. работает поверх него")
-                return
+            # доп. туннель не требует основного: он несёт только свои маршруты
             if os.path.exists(os.path.join(STATE, "error")):
                 os.remove(os.path.join(STATE, "error"))
             net("aux", "up", pid, timeout=180)
@@ -1119,12 +1117,14 @@ transition:opacity .13s ease,transform .13s ease,visibility .13s}
 <div id="profiles-wg"></div>
 <button class="ghost" onclick="openImport('wireguard')">+ Добавить WireGuard</button>
 <div class="hint">Кнопка «+» на карточке подключает профиль как дополнительный туннель: в него
-уходят только его сети (корпоративная и т.п.), интернет остаётся у основного профиля.</div>
+уходят только его сети (корпоративная и т.п.), интернет идёт как обычно — через основной VPN,
+если он включён, иначе напрямую. Доп. туннели работают и при выключенном основном.</div>
 
 <div class="sec">Доп. туннели</div>
 <div class="card">
   <div id="auxrows"></div>
-  <div class="hint" id="auxempty">Не подключены. Нажми «+» на карточке профиля.</div>
+  <div class="hint" id="auxempty">Не подключены. Нажми «+» на карточке профиля — доп. туннели
+  работают и без основного VPN, интернет при этом остаётся как есть.</div>
 </div>
 
 <div class="sec">Сервис</div>
