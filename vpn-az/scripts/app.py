@@ -20,7 +20,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import urllib.request
 from urllib.parse import urlparse, parse_qs
 
-VERSION = "3.4.4"
+VERSION = "3.4.5"
 DATA = os.environ.get("DATA", "/data")
 PORT = int(os.environ.get("APP_PORT", "8666"))
 NET_SH = os.path.join(DATA, "net.sh")
@@ -976,7 +976,7 @@ transition:opacity .13s ease,transform .13s ease,visibility .13s}
   <div class="row"><span class="k kw"><span>Перехват DNS всех приложений</span><span class="q" tabindex="0" role="button" aria-label="Пояснение: перехват DNS" data-tip="Все запросы на порт 53 (UDP и TCP) от приложений Umbrel уходят в локальный резолвер Umbrel, а он спрашивает 1.1.1.1 напрямую, мимо туннеля. Спасает, когда VPN-сервер перехватывает DNS и отдаёт адреса, по которым ничего не открывается. DoH/DoT (порты 443 и 853) не трогает.">?</span></span><div class="sw" id="swdns" onclick="setOpt('dns')"></div></div>
   <div class="row"><span class="k kw"><span>Автоподключение при старте</span><span class="q" tabindex="0" role="button" aria-label="Пояснение: автоподключение при старте" data-tip="Поднимать выбранный профиль сам после перезагрузки Umbrel или перезапуска приложения. Туннель, выключенный вручную, сам не включится.">?</span></span><div class="sw" id="swauto" onclick="setOpt('auto')"></div></div>
   <div class="row"><span class="k kw"><span>NAT в домашнюю сеть</span><span class="q" tabindex="0" role="button" aria-label="Пояснение: NAT в домашнюю сеть" data-tip="Маскарад для клиентов VPN в локальную сеть этого Umbrel: телефон из VPN сможет зайти на NAS, принтер, веб-морду роутера. Маршрут к локальной подсети клиент должен знать сам — её актуальное значение приходит в уведомлении Telegram, строка LAN.">?</span></span><div class="sw" id="swlan" onclick="setOpt('lan')"></div></div>
-  <div class="row"><span class="k kw"><span>Уведомления в Telegram</span><span class="q" tabindex="0" role="button" aria-label="Пояснение: уведомления в Telegram" data-tip="После подключения и после запуска сервера присылает в Telegram адрес в туннеле, LAN-адрес и внешний IP — по ним видно, куда заходить с телефона. Одинаковые адреса дважды не отправляются.">?</span></span><span style="display:flex;align-items:center;gap:10px"><button class="mini" title="Настройки уведомлений" onclick="tgSetup()">&#9881;</button><div class="sw" id="swtg" onclick="setOpt('tg')"></div></span></div>
+  <div class="row"><span class="k kw"><span>Уведомления в Telegram</span><span class="q" tabindex="0" role="button" aria-label="Пояснение: уведомления в Telegram" data-tip="После подключения и после запуска сервера присылает в Telegram адрес в туннеле, LAN-адрес, внешний IP и ссылки на все приложения Umbrel — по ним видно, куда заходить с телефона. Одинаковые адреса дважды не отправляются.">?</span></span><span style="display:flex;align-items:center;gap:10px"><button class="mini" title="Настройки уведомлений" onclick="tgSetup()">&#9881;</button><div class="sw" id="swtg" onclick="setOpt('tg')"></div></span></div>
 </div>
 <div class="hint bad" id="warn" style="display:none"></div>
 <button class="ghost" onclick="diag()">Диагностика и журнал</button>
