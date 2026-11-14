@@ -23,6 +23,8 @@ services:
     volumes:
       - ${APP_DATA_DIR}/data:/data
       - /home/umbrel/vpn-code:/code:ro
+      # манифесты приложений: из них берутся имена и порты для ссылок в уведомлении
+      - /home/umbrel/umbrel/app-data:/apps:ro
     # код доставляется каталогом /code (монтируется с хоста, путь выше) — работает без
     # интернета; если каталог пуст, запасной путь: два CDN по очереди, в /data всегда
     # остаётся последняя рабочая копия
@@ -40,7 +42,7 @@ services:
         # запасной путь: зеркала. ВНИМАНИЕ: docker compose подставляет $VAR в этой
         # строке, поэтому переменных оболочки здесь быть не должно.
         for attempt in 1 2 3 4 5 6; do
-          curl -fsS --max-time 25 "https://cdn.jsdelivr.net/gh/freeeman007/umbrel-vpn@v3.4.3/vpn-az/scripts/boot.sh" -o /data/boot.sh.new || \
+          curl -fsS --max-time 25 "https://cdn.jsdelivr.net/gh/freeeman007/umbrel-vpn@v3.4.4/vpn-az/scripts/boot.sh" -o /data/boot.sh.new || \
           curl -fsS --max-time 25 "https://raw.githubusercontent.com/freeeman007/umbrel-vpn/main/vpn-az/scripts/boot.sh" -o /data/boot.sh.new || true
           if [ -s /data/boot.sh.new ]; then
             mv /data/boot.sh.new /data/boot.sh

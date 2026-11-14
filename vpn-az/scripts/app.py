@@ -20,7 +20,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import urllib.request
 from urllib.parse import urlparse, parse_qs
 
-VERSION = "3.4.3"
+VERSION = "3.4.4"
 DATA = os.environ.get("DATA", "/data")
 PORT = int(os.environ.get("APP_PORT", "8666"))
 NET_SH = os.path.join(DATA, "net.sh")
@@ -510,6 +510,13 @@ def check_url(url, via=""):
 # Сообщение в Telegram о том, какие адреса получил сервер: туннельный (по нему
 # заходишь с телефона), LAN (в новом месте он каждый раз разный) и внешний.
 # Токен и chat_id лежат в /data/telegram.json (0600) — в репозиторий не попадают.
+APPS_DIR = os.environ.get("APPS_DIR", "/apps")
+# Подстраховка на случай, если каталог приложений Umbrel ещё не смонтирован в /apps:
+# порты стандартные для этих приложений. Как только /apps появится, список берётся
+# из манифестов и этот не используется.
+FALLBACK_LINKS = [("AdminPanelAZ", 8000), ("Baikal", 8890), ("Cloudflare Tunnel", 4499),
+                  ("Hermes Agent", 18790), ("Immich", 2283), ("Murmur", 18793),
+                  ("Nextcloud", 8081), ("VPN AZ", 8666)]
 TG_CONF = os.path.join(DATA, "telegram.json")
 TG_ON = os.path.join(STATE, "tg_on")
 TG_SENT = os.path.join(STATE, "tg_sent.json")
@@ -565,6 +572,36 @@ def tg_send(text):
         return False, str(e)
 
 
+def app_links(ip):
+    """Ссылки на всё, что запущено на Umbrel: имя и порт берутся из манифеста
+    приложения (app-data монтируется в /apps), плюс подстраховочный список —
+    он нужен, пока каталог не смонтирован, и для сервисов без манифеста."""
+    items = [("Дашборд Umbrel", "http://%s/" % ip, 80)]
+    seen = {80}
+    if os.path.isdir(APPS_DIR):
+        for name in sorted(os.listdir(APPS_DIR)):
+            txt = read(os.path.join(APPS_DIR, name, "umbrel-app.yml"), "")
+            if not txt:
+                continue
+            mport = re.search(r"^port:\s*[\"']?(\d+)", txt, re.M)
+            if not mport:
+                continue
+            port = int(mport.group(1))
+            if port in seen:
+                continue
+            mname = re.search(r"^name:\s*[\"']?(.+?)[\"']?\s*$", txt, re.M)
+            items.append(((mname.group(1).strip() if mname else name),
+                          "http://%s:%d/" % (ip, port), port))
+            seen.add(port)
+    if len(items) == 1:  # манифестов не видно — берём подстраховочный список
+        for name, port in FALLBACK_LINKS:
+            if port in seen:
+                continue
+            items.append((name, "http://%s:%d/" % (ip, port), port))
+            seen.add(port)
+    return items
+
+
 def tg_text(reason):
     st = status()
     tun = st.get("tunnel") or {}
@@ -573,25 +610,35 @@ def tg_text(reason):
     eg = (st.get("egress") or {}).get("tunnel") or "—"
     prof = (st.get("active") or {}).get("name") or st.get("active_id") or "—"
     mode = "весь трафик" if tun.get("default_via_tunnel") else "split"
+    links = app_links(ip)
     lines = [
         "VPN AZ · Umbrel — %s" % reason,
         "профиль: %s (%s)" % (prof, mode),
         "адрес в туннеле: %s" % ip,
         "LAN: %s" % lan,
         "выход в интернет: %s" % eg,
-        "дашборд: http://%s/" % ip,
-        "панель: http://%s:8666/" % ip,
+        "",
+        "Ссылки:",
     ]
-    return "\n".join(lines), "%s|%s|%s|%s" % (ip, lan, eg, prof)
+    for name, url, _port in links:
+        lines.append("%s — %s" % (name, url))
+    return "\n".join(lines), "%s|%s|%s|%s|%s" % (
+        ip, lan, eg, prof, ",".join(str(x[2]) for x in links))
 
 
-def tg_report(reason="подключено", force=False):
-    """Отправить адреса в Telegram. Одинаковый набор адресов дважды не шлём."""
+def tg_report(reason="подключено", force=False, tries=1, gap=8):
+    """Отправить адреса в Telegram. Одинаковый набор адресов дважды не шлём.
+
+    Сразу после подъёма туннеля сеть ещё может быть недоступна (маршруты
+    перестраиваются, особенно при смене профиля) — поэтому несколько попыток.
+    """
     if not tg_enabled():
         return
     if not TG_LOCK.acquire(blocking=False):
         return
     try:
+        if not force and phase() != "on":
+            return  # туннель не поднялся — отправлять нечего, а «—» в сообщении путает
         text, key = tg_text(reason)
         try:
             prev = json.loads(read(TG_SENT, "") or "{}")
@@ -599,9 +646,18 @@ def tg_report(reason="подключено", force=False):
             prev = {}
         if not force and prev.get("key") == key:
             return
-        ok, err = tg_send(text)
+        ok, err = False, ""
+        for i in range(max(1, tries)):
+            ok, err = tg_send(text)
+            if ok:
+                break
+            if i + 1 < max(1, tries):
+                time.sleep(gap)
         if ok:
             write(TG_SENT, json.dumps({"key": key, "at": int(time.time())}, ensure_ascii=False))
+            pe = os.path.join(STATE, "tg_error")
+            if os.path.exists(pe):
+                os.remove(pe)
         else:
             write(os.path.join(STATE, "tg_error"), err or "ошибка отправки")
     finally:
@@ -615,7 +671,7 @@ def _tg_sent_at():
         return 0
 
 
-def tg_report_later(reason, delay=3.0):
+def tg_report_later(reason, delay=3.0, tries=1):
     def _run():
         time.sleep(delay)
         try:
@@ -623,7 +679,7 @@ def tg_report_later(reason, delay=3.0):
             # иначе в сообщении окажется адрес, снятый до подъёма туннеля
             if int(EGRESS.get("at") or 0) < time.time() - 45:
                 egress_once()
-            tg_report(reason)
+            tg_report(reason, tries=tries)
         except Exception:  # noqa: BLE001
             pass
     threading.Thread(target=_run, daemon=True).start()
@@ -641,7 +697,7 @@ def do_connect(pid):
         write(os.path.join(STATE, "phase"), "connecting")
         net("connect", pid, timeout=240)
         if phase() == "on":
-            tg_report_later("подключено")
+            tg_report_later("подключено", tries=6)
         return phase() == "on"
     finally:
         CONN_LOCK.release()
@@ -686,7 +742,7 @@ def boot():
             net("resume", _pid, timeout=300)
             EGRESS_WAKE.set()
             if phase() == "on":
-                tg_report_later("сервер запущен, туннель поднят", delay=4)
+                tg_report_later("сервер запущен, туннель поднят", delay=4, tries=6)
             elif tg_enabled():
                 # о неудаче молчать нельзя: узнать о ней иначе можно только на месте
                 _err = state("error") or phase()
@@ -919,7 +975,7 @@ transition:opacity .13s ease,transform .13s ease,visibility .13s}
 <div class="card">
   <div class="row"><span class="k kw"><span>Перехват DNS всех приложений</span><span class="q" tabindex="0" role="button" aria-label="Пояснение: перехват DNS" data-tip="Все запросы на порт 53 (UDP и TCP) от приложений Umbrel уходят в локальный резолвер Umbrel, а он спрашивает 1.1.1.1 напрямую, мимо туннеля. Спасает, когда VPN-сервер перехватывает DNS и отдаёт адреса, по которым ничего не открывается. DoH/DoT (порты 443 и 853) не трогает.">?</span></span><div class="sw" id="swdns" onclick="setOpt('dns')"></div></div>
   <div class="row"><span class="k kw"><span>Автоподключение при старте</span><span class="q" tabindex="0" role="button" aria-label="Пояснение: автоподключение при старте" data-tip="Поднимать выбранный профиль сам после перезагрузки Umbrel или перезапуска приложения. Туннель, выключенный вручную, сам не включится.">?</span></span><div class="sw" id="swauto" onclick="setOpt('auto')"></div></div>
-  <div class="row"><span class="k kw"><span>NAT в домашнюю сеть</span><span class="q" tabindex="0" role="button" aria-label="Пояснение: NAT в домашнюю сеть" data-tip="Маскарад для клиентов VPN в локальную сеть этого Umbrel: телефон из VPN сможет зайти на NAS, принтер, веб-морду роутера. Маршрут к локальной подсети клиент должен знать сам — серверный пуш 192.168.11.0/24 убран, потому что при переезде подсеть меняется. Актуальная подсеть приходит в сообщении Telegram (строка LAN).">?</span></span><div class="sw" id="swlan" onclick="setOpt('lan')"></div></div>
+  <div class="row"><span class="k kw"><span>NAT в домашнюю сеть</span><span class="q" tabindex="0" role="button" aria-label="Пояснение: NAT в домашнюю сеть" data-tip="Маскарад для клиентов VPN в локальную сеть этого Umbrel: телефон из VPN сможет зайти на NAS, принтер, веб-морду роутера. Маршрут к локальной подсети клиент должен знать сам — её актуальное значение приходит в уведомлении Telegram, строка LAN.">?</span></span><div class="sw" id="swlan" onclick="setOpt('lan')"></div></div>
   <div class="row"><span class="k kw"><span>Уведомления в Telegram</span><span class="q" tabindex="0" role="button" aria-label="Пояснение: уведомления в Telegram" data-tip="После подключения и после запуска сервера присылает в Telegram адрес в туннеле, LAN-адрес и внешний IP — по ним видно, куда заходить с телефона. Одинаковые адреса дважды не отправляются.">?</span></span><span style="display:flex;align-items:center;gap:10px"><button class="mini" title="Настройки уведомлений" onclick="tgSetup()">&#9881;</button><div class="sw" id="swtg" onclick="setOpt('tg')"></div></span></div>
 </div>
 <div class="hint bad" id="warn" style="display:none"></div>
@@ -1319,8 +1375,10 @@ class Handler(BaseHTTPRequestHandler):
                     ensure_ascii=False))
             _txt, _ = tg_text("проверка связи")
             _ok, _err = tg_send(_txt)
+            # текст возвращаем, чтобы было видно, что именно ушло (секретов в нём нет)
             return self._send(200 if _ok else 502,
-                              json.dumps({"ok": _ok, "error": _err}, ensure_ascii=False))
+                              json.dumps({"ok": _ok, "error": _err, "text": _txt},
+                                         ensure_ascii=False))
 
         if u.path in ("/api/dns_on", "/api/dns_off", "/api/lan_on", "/api/lan_off"):
             what = "dns" if "dns" in u.path else "lan"
