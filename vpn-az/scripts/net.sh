@@ -419,9 +419,11 @@ aux_up() { # aux_up <id> — поднять профиль как дополни
     aux_alive "$_id" && { aux_add "$_id"; log "aux[$_id]: уже поднят"; return 0; }
     aux_add "$_id"
     case "$_t" in
-        ovpn) aux_ovpn_up "$_id" || { aux_forget "$_id"; return 1 ;} ;;
-        wg)   aux_wg_up   "$_id" || { aux_forget "$_id"; return 1 ;} ;;
+        ovpn) aux_ovpn_up "$_id" || { echo "$(date +%s)" > "$STATE/aux_try.$_id"; return 1 ;} ;;
+        wg)   aux_wg_up   "$_id" || { echo "$(date +%s)" > "$STATE/aux_try.$_id"; return 1 ;} ;;
     esac
+    rm -f "$STATE/aux_try.$_id"
+    case "$(warn)" in *"$_id"*) clear_warn ;; esac
     return 0
 }
 
@@ -429,7 +431,7 @@ aux_down() { # aux_down <id>
     _id=$1; [ -n "$_id" ] || return 0
     _t=$(prof_type "$_id"); _dev=$(dev_aux "$_id" "$_t")
     pkill -f "openvpn.*--dev $_dev" 2>/dev/null || true
-    rm -f "$STATE/ovpnx.$_id.pid"
+    rm -f "$STATE/ovpnx.$_id.pid" "$STATE/aux_try.$_id"
     rule_del mangle POSTROUTING -o "$_dev" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
     rule_del mangle OUTPUT -o "$_dev" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
     ip -4 route flush dev "$_dev" 2>/dev/null || true
@@ -846,7 +848,15 @@ watch() {
         # доп. туннели: устройство пропало — поднимаем заново (не чаще раза в цикл)
         for _a in $(aux_list 2>/dev/null); do
             [ -n "$_a" ] || continue
-            aux_alive "$_a" || { log "watch: доп. туннель $_a пропал — поднимаю"; aux_up "$_a" || true; }
+            aux_alive "$_a" && continue
+            _try=$(cat "$STATE/aux_try.$_a" 2>/dev/null || echo 0)
+            _age=$(( $(date +%s) - ${_try:-0} ))
+            if [ "$_age" -lt 90 ]; then
+                log "watch: доп. туннель $_a не поднят, прошло ${_age}с — жду кулдаун 90 с"
+                continue
+            fi
+            log "watch: доп. туннель $_a пропал — поднимаю"
+            aux_up "$_a" || true
         done
     fi
 }
