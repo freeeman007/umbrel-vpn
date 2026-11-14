@@ -49,6 +49,9 @@ prof_type() {
     esac
 }
 full_tunnel() { # full_tunnel <id>
+    # сервер может присылать redirect-gateway push'ем — такой профиль ведёт себя как
+    # «весь трафик», хотя в конфиге этого нет. Факт запоминает app.py в state/full_<id>.
+    [ "$(cat "$STATE/full_$1" 2>/dev/null)" = "1" ] && return 0
     _c=$(prof_conf "$1"); [ -n "$_c" ] || return 1
     case "$(prof_type "$1")" in
         ovpn) grep -qiE '^[[:space:]]*(redirect-gateway|route[[:space:]]+0\.0\.0\.0[[:space:]]+0\.0\.0\.0)' "$_c" ;;

@@ -20,7 +20,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import urllib.request
 from urllib.parse import urlparse, parse_qs
 
-VERSION = "3.7.4"
+VERSION = "3.7.5"
 DATA = os.environ.get("DATA", "/data")
 PORT = int(os.environ.get("APP_PORT", "8666"))
 NET_SH = os.path.join(DATA, "net.sh")
@@ -170,6 +170,19 @@ def conf_meta(path):
     return meta
 
 
+def full_learned(pid):
+    """1 — профиль на деле забирает default, 0 — сплит, None — ещё не проверяли.
+
+    Часть серверов присылает redirect-gateway push'ем, и в клиентском конфиге
+    этого не видно. Режим запоминаем при подключении (app.py пишет state/full_<id>).
+    """
+    f = os.path.join(STATE, "full_" + pid)
+    t = read(f, "").strip()
+    if t in ("0", "1"):
+        return t == "1"
+    return None
+
+
 def profile(pid):
     d = profile_dir(pid)
     if not os.path.isdir(d):
@@ -190,7 +203,10 @@ def profile(pid):
         "created": pj.get("created") or int(os.path.getmtime(d)),
         "config": os.path.basename(conf) if conf else "",
         "remotes": meta["remotes"],
-        "full_tunnel": meta["full_tunnel"],
+        "full_tunnel": bool(meta["full_tunnel"]) or (full_learned(pid) is True),
+        "mode": "full" if meta["full_tunnel"] else
+                ("full-server" if full_learned(pid) is True else
+                 ("split" if full_learned(pid) is False else "unknown")),
         "has_creds": os.path.exists(os.path.join(d, "cred.txt")),
         "has_pass": os.path.exists(os.path.join(d, "pass.txt")),
         "awg": bool(meta.get("awg")),
@@ -500,6 +516,16 @@ def status():
     aid = state("active")
     prof = profile(aid) if aid else None
     dev = tun_dev()
+    # запоминаем фактический режим профиля: сервер может присылать redirect-gateway,
+    # и тогда «split» в конфиге ничего не значит
+    if ph == "on" and aid and dev:
+        _f = os.path.join(STATE, "full_" + aid)
+        _now = "1" if default_via_tunnel() else "0"
+        if read(_f, "").strip() != _now:
+            try:
+                write(_f, _now)
+            except OSError:
+                pass
     st = {
         "version": VERSION,
         "time": int(time.time()),
@@ -667,7 +693,7 @@ def profile_full(pid):
     return {
         "id": pid, "name": p["name"], "type": p["type"],
         "config": p["config"], "text": read(find_conf(pid), ""),
-        "full_tunnel": p["full_tunnel"], "remotes": p["remotes"],
+        "full_tunnel": p["full_tunnel"], "mode": p.get("mode"), "remotes": p["remotes"],
         "has_pass": p["has_pass"], "has_creds": p["has_creds"],
         "files": p["files"], "missing": p["missing"],
     }
@@ -1257,7 +1283,7 @@ function render(){
   function profCard(x){
     const sel=x.id===S.active_id;
     const ax=(S.aux||[]).filter(function(a){return a.id===x.id;})[0];
-    let meta=(x.full_tunnel?'весь трафик · ':'')+
+    let meta=((x.full_tunnel||x.mode==='full-server')?'весь трафик · ':'')+
       (x.remotes&&x.remotes.length?x.remotes[0]+' ':'')+
       (x.missing&&x.missing.length?'нет файлов: '+x.missing.join(','):'');
     if(ax) meta=(ax.up?ax.ip+' · ':'подключается… · ')+meta;
@@ -1334,7 +1360,9 @@ async function openProfile(id){
   PD=r;
   document.getElementById('pdt').textContent=(r.type==='openvpn'?'OpenVPN':'WireGuard')+' · '+esc(r.config||'');
   let meta=(r.remotes||[]).join(', ')||'адрес сервера не найден';
-  meta+=(r.full_tunnel?' · весь трафик':' · split');
+  meta+=(r.mode==='full'?' · весь трафик (в конфиге)':
+         (r.mode==='full-server'?' · весь трафик (сервер присылает redirect-gateway)':
+          (r.mode==='split'?' · split':' · режим уточнится после подключения')));
   if(r.has_creds) meta+=' · есть логин/пароль';
   if(r.has_pass) meta+=' · ключ под паролем';
   if((r.missing||[]).length) meta+=' · не хватает: '+r.missing.join(', ');
@@ -1733,6 +1761,26 @@ class Handler(BaseHTTPRequestHandler):
             if os.path.exists(cf):
                 os.remove(cf)
             return self._send(200, json.dumps({"ok": True}, ensure_ascii=False))
+
+        if u.path == "/api/mode":
+            # ручная фиксация режима профиля: авто (по факту при подключении),
+            # full (весь трафик) или split. Нужна, когда сервер присылает
+            # redirect-gateway, а конфиг об этом молчит.
+            pid = (q.get("id") or [""])[0]
+            mode = (q.get("mode") or ["auto"])[0]
+            _p = profile(pid)
+            if not _p:
+                return self._send(404, json.dumps({"error": "нет такого профиля"},
+                                                  ensure_ascii=False))
+            f = os.path.join(STATE, "full_" + pid)
+            if mode == "auto":
+                if os.path.exists(f):
+                    os.remove(f)
+            else:
+                write(f, "1" if mode == "full" else "0")
+            _p2 = profile(pid) or {}
+            return self._send(200, json.dumps({"ok": True, "mode": _p2.get("mode")},
+                                              ensure_ascii=False))
 
         if u.path in ("/api/aux_on", "/api/aux_off"):
             pid = (q.get("id") or [""])[0]
