@@ -20,7 +20,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import urllib.request
 from urllib.parse import urlparse, parse_qs
 
-VERSION = "3.4.5"
+VERSION = "3.4.6"
 DATA = os.environ.get("DATA", "/data")
 PORT = int(os.environ.get("APP_PORT", "8666"))
 NET_SH = os.path.join(DATA, "net.sh")
@@ -1375,6 +1375,9 @@ class Handler(BaseHTTPRequestHandler):
                     ensure_ascii=False))
             _txt, _ = tg_text("проверка связи")
             _ok, _err = tg_send(_txt)
+            _pe = os.path.join(STATE, "tg_error")
+            if _ok and os.path.exists(_pe):
+                os.remove(_pe)  # удачная отправка снимает прошлую ошибку из статуса
             # текст возвращаем, чтобы было видно, что именно ушло (секретов в нём нет)
             return self._send(200 if _ok else 502,
                               json.dumps({"ok": _ok, "error": _err, "text": _txt},
