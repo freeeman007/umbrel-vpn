@@ -8,7 +8,7 @@ log() { echo "$(date -u +%FT%TZ) boot: $*" ; }
 # зеркала: сначала тег релиза в jsDelivr (кэш тегов иммутабельный, поэтому не бывает
 # устаревших скриптов), затем raw.githubusercontent как запас. @main не использовать:
 # jsDelivr держит кэш ветки часами и app.py приезжает старый.
-MIRRORS="https://cdn.jsdelivr.net/gh/freeeman007/umbrel-vpn@v3.1.0/vpn-az/scripts
+MIRRORS="https://cdn.jsdelivr.net/gh/freeeman007/umbrel-vpn@v3.2.0/vpn-az/scripts
 https://raw.githubusercontent.com/freeeman007/umbrel-vpn/main/vpn-az/scripts"
 
 mkdir -p "$DATA" "$DATA/profiles" "$DATA/state"
@@ -28,21 +28,33 @@ apk add --no-cache $PKGS >>"$DATA/apk.log" 2>&1 || { apk update >>"$DATA/apk.log
     apk add --no-cache $PKGS >>"$DATA/apk.log" 2>&1; }
 
 # fetch <имя> <минимальный размер> — скачать с зеркал, сохранить рабочую копию
+# 3.2.0: ретраи + диагностика. Если проверка TLS не проходит (нет CA-бандла в образе),
+# повторяем с -k — код берётся из нашего же репозитория, но факт фиксируем в логе.
 fetch() {
     _name=$1; _min=$2
-    for _m in $MIRRORS; do
-        if curl -fsS --max-time 25 "$_m/$_name?v=$(date +%s)" -o "$DATA/$_name.new" 2>/dev/null; then
-            _sz=$(wc -c <"$DATA/$_name.new" 2>/dev/null || echo 0)
-            if [ "$_sz" -ge "$_min" ]; then
-                mv "$DATA/$_name.new" "$DATA/$_name"
-                log "обновлён $_name ($_sz байт)"
-                return 0
-            fi
-            log "битая копия $_name ($_sz байт), пробую другое зеркало"
-            rm -f "$DATA/$_name.new"
-        fi
+    _try=0
+    while [ "$_try" -lt 6 ]; do
+        _try=$((_try+1))
+        for _m in $MIRRORS; do
+            for _opt in "" "-k"; do
+                if curl -fsS $_opt --max-time 25 --retry 2 --retry-delay 2 \
+                        "$_m/$_name" -o "$DATA/$_name.new" 2>/tmp/curlerr; then
+                    _sz=$(wc -c <"$DATA/$_name.new" 2>/dev/null || echo 0)
+                    if [ "$_sz" -ge "$_min" ]; then
+                        mv "$DATA/$_name.new" "$DATA/$_name"
+                        log "обновлён $_name ($_sz байт${_opt:+, без проверки TLS})"
+                        return 0
+                    fi
+                    log "битая копия $_name ($_sz байт, ожидалось >= $_min)"
+                    rm -f "$DATA/$_name.new"
+                else
+                    log "curl $_name [$_m${_opt}] не удался: $(head -c 200 /tmp/curlerr 2>/dev/null | tr '\n' ' ')"
+                fi
+            done
+        done
+        sleep 10
     done
-    [ -f "$DATA/$_name" ] && log "не скачал $_name, использую сохранённый"
+    [ -f "$DATA/$_name" ] && log "не скачал $_name за $_try попыток, использую сохранённый"
     return 1
 }
 
