@@ -19,7 +19,7 @@ import zlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
-VERSION = "3.2.2"
+VERSION = "3.2.3"
 DATA = os.environ.get("DATA", "/data")
 PORT = int(os.environ.get("APP_PORT", "8666"))
 NET_SH = os.path.join(DATA, "net.sh")
@@ -461,6 +461,8 @@ def do_connect(pid):
 
 def do_disconnect():
     net("disconnect", timeout=90)
+    # пользователь выключил туннель руками — автоподъём при следующем старте не нужен
+    net("forget", timeout=30)
 
 
 def watch_loop():
@@ -479,15 +481,19 @@ def boot():
     threading.Thread(target=watch_loop, daemon=True).start()
     time.sleep(2)
     ph = phase()
-    auto = os.path.exists(os.path.join(STATE, "autostart")) and bool(state("active"))
-    if ph == "connecting":
+    _act = state("active")
+    want = os.path.exists(os.path.join(STATE, "want_on")) and bool(_act)
+    auto = os.path.exists(os.path.join(STATE, "autostart")) and bool(_act)
+    if want or auto:
+        # туннель был включён до перезагрузки сервера/перезапуска контейнера:
+        # net.sh resume сам дождётся сети, поднимет профиль и повторит попытку при сбое
+        _pid = _act
+        threading.Thread(target=lambda: net("resume", _pid, timeout=300), daemon=True).start()
+    elif ph == "connecting":
         # контейнер упал посреди подключения — не оставляем полутуннель
         net("disconnect", timeout=60)
         write(os.path.join(STATE, "phase"), "failed")
         write(os.path.join(STATE, "error"), "подключение было прервано перезапуском — включи заново")
-    elif auto:
-        # автостарт: поднимаем последний профиль, даже если штатная остановка сняла туннель
-        threading.Thread(target=lambda: do_connect(state("active")), daemon=True).start()
     elif ph == "on" and state("active"):
         threading.Thread(target=lambda: do_connect(state("active")), daemon=True).start()
 
@@ -926,8 +932,11 @@ class Handler(BaseHTTPRequestHandler):
             on = u.path.endswith("_on")
             if on:
                 write(flag, "1\n")
-            elif os.path.exists(flag):
-                os.remove(flag)
+            else:
+                # выключили автостарт — снимаем и намерение, иначе resume поднимет туннель
+                net("forget", timeout=30)
+                if os.path.exists(flag):
+                    os.remove(flag)
             return self._send(200, json.dumps({"ok": True, "on": on}))
 
         if u.path in ("/api/dns_on", "/api/dns_off", "/api/lan_on", "/api/lan_off"):
@@ -946,6 +955,7 @@ class Handler(BaseHTTPRequestHandler):
             if pid and os.path.isdir(profile_dir(pid)):
                 if state("active") == pid:
                     net("disconnect", timeout=90)
+                    net("forget", timeout=30)
                     for f in ("active", "since"):
                         p = os.path.join(STATE, f)
                         if os.path.exists(p):

@@ -1,0 +1,13 @@
+IP link show azvpn
+IP link show wg0
+IPT -t mangle -D OUTPUT -p udp --dport 53 -j MARK --set-mark 0x53
+IPT -t mangle -D OUTPUT -p udp --dport 53 -j MARK --set-mark 0x53
+IPT -t mangle -D OUTPUT -p udp --dport 53 -j MARK --set-mark 0x53
+IPT -t mangle -D OUTPUT -p tcp --dport 53 -j MARK --set-mark 0x53
+IPT -t mangle -D OUTPUT -p tcp --dport 53 -j MARK --set-mark 0x53
+IP rule del fwmark 0x53 lookup 53 priority 999
+IP route flush table 53
+IPT -t nat -D OUTPUT -p udp --dport 53 -j VPN_DNS
+IPT -t nat -D OUTPUT -p tcp --dport 53 -j VPN_DNS
+IPT -t nat -F VPN_DNS
+IPT -t nat -X VPN_DNS

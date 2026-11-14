@@ -8,12 +8,12 @@ log() { echo "$(date -u +%FT%TZ) boot: $*" ; }
 # зеркала: сначала тег релиза в jsDelivr (кэш тегов иммутабельный, поэтому не бывает
 # устаревших скриптов), затем raw.githubusercontent как запас. @main не использовать:
 # jsDelivr держит кэш ветки часами и app.py приезжает старый.
-MIRRORS="https://cdn.jsdelivr.net/gh/freeeman007/umbrel-vpn@v3.2.1/vpn-az/scripts
+MIRRORS="https://cdn.jsdelivr.net/gh/freeeman007/umbrel-vpn@v3.2.3/vpn-az/scripts
 https://raw.githubusercontent.com/freeeman007/umbrel-vpn/main/vpn-az/scripts"
 
 mkdir -p "$DATA" "$DATA/profiles" "$DATA/state"
 
-trap 'log "остановка — снимаю туннель и перехват DNS"; sh "$DATA/net.sh" disconnect 2>/dev/null; sh "$DATA/net.sh" dns off 2>/dev/null; exit 0' TERM INT
+trap 'log "остановка — снимаю туннель и перехват DNS (намерение включения сохраняю)"; sh "$DATA/net.sh" stop 2>/dev/null; sh "$DATA/net.sh" dns off 2>/dev/null; exit 0' TERM INT
 
 # /dev/net/tun может отсутствовать до загрузки модуля tun
 if [ ! -e /dev/net/tun ]; then
@@ -63,15 +63,17 @@ fetch() {
 # скрипты по SSH, приложение забирает их без интернета и без обновления из стора.
 SRC=${SRC:-/code}
 
-# sync_src — забрать net.sh/app.py из $SRC, если там другая версия. 0 = что-то обновили
+# sync_src — забрать net.sh/app.py из $SRC, если там другая версия. 0 = что-то обновили.
+# ВАЖНО: 0 — это успех для `if sync_src`, поэтому «ничего не меняли» = 1. Раньше было
+# наоборот, и статус-сервер убивался каждую минуту, даже когда файлы те же.
 sync_src() {
-    _ch=0
+    _ch=1
     for _f in net.sh app.py; do
         [ -s "$SRC/$_f" ] || continue
         if ! cmp -s "$SRC/$_f" "$DATA/$_f"; then
             if cp "$SRC/$_f" "$DATA/$_f"; then
                 log "скрипт $_f обновлён из $SRC ($(wc -c <"$DATA/$_f") байт)"
-                _ch=1
+                _ch=0
             fi
         fi
     done
@@ -87,6 +89,13 @@ else
 fi
 chmod +x "$DATA/net.sh" 2>/dev/null
 
+# саморемонт: контейнер мог умереть в момент пробы, когда DNS хоста был уведён в туннель.
+# Такие правила живут в netns хоста и переживают падение контейнера — снимаем их сразу.
+sh "$DATA/net.sh" guard 2>&1 | tee -a "$DATA/net.log"
+
+# автоподъём после включения/перезагрузки сервера делает app.py (boot() -> net.sh resume):
+# он знает про state/want_on и state/autostart, здесь второй драйвер не нужен.
+
 trim() {
     [ -f "$1" ] || return 0
     _sz=$(wc -c <"$1" 2>/dev/null || echo 0)
@@ -101,7 +110,7 @@ log "старт статус-сервера"
         sleep 60
         if sync_src; then
             log "перезапуск статус-сервера после обновления из $SRC"
-            pkill -f "$DATA/app.py" 2>/dev/null
+            pkill -f "python3 .*app\.py" 2>/dev/null
         fi
     done
 ) &

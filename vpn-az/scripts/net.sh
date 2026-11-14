@@ -99,6 +99,32 @@ protect_lan() {
         && log "lan: $LAN_NET оставлен напрямую через $LAN_GW (доступ к серверу не теряется)"
 }
 
+# Резолверы выводятся мимо туннеля отдельными /32 — это надёжнее, чем метка в OUTPUT:
+# маршрут /32 сильнее 0.0.0.0/1+128.0.0.0/1 и работает сразу, без ожидания проб.
+# Зачем: сервер AZ на полном туннеле делает DNAT :53 клиентов в 127.2.2.2, который
+# не отвечает, — и хост (вместе с агентом) остаётся без имён, хотя IP-связность есть.
+protect_resolvers() {
+    lan_info
+    [ -n "${LAN_GW:-}" ] && [ -n "${LAN_IF:-}" ] || return 0
+    _n=0
+    for _ns in $(awk '/^nameserver[ \t]+[0-9.]+/{print $2}' /etc/resolv.conf 2>/dev/null) \
+               "$DNS_UPSTREAM" 1.1.1.1 9.9.9.9 8.8.8.8; do
+        case "$_ns" in 127.*|0.0.0.0|"") continue ;; esac
+        ip route replace "$_ns/32" via "$LAN_GW" dev "$LAN_IF" 2>/dev/null && _n=$((_n+1))
+    done
+    [ "$_n" -gt 0 ] && log "dns: резолверы ($_n) выведены мимо туннеля через $LAN_GW"
+    return 0
+}
+
+unprotect_resolvers() {
+    for _ns in $(awk '/^nameserver[ \t]+[0-9.]+/{print $2}' /etc/resolv.conf 2>/dev/null) \
+               "$DNS_UPSTREAM" 1.1.1.1 9.9.9.9 8.8.8.8; do
+        case "$_ns" in 127.*|0.0.0.0|"") continue ;; esac
+        ip route del "$_ns/32" 2>/dev/null
+    done
+    return 0
+}
+
 # ---------------------------------------------------------------- openvpn
 ovpn_pid_file() { echo "$STATE/ovpn.$1.pid" ; }
 ovpn_alive() {
@@ -129,14 +155,23 @@ ovpn_start() { # ovpn_start <id>
     _ep_ip=$(resolve4 "$_ep_host")
     [ -n "$_ep_ip" ] || _ep_ip=$_ep_host
     [ -n "$_ep_ip" ] && [ -n "${LAN_GW:-}" ] && ip route replace "$_ep_ip/32" via "$LAN_GW" dev "$LAN_IF" 2>/dev/null
+    # резолверы тоже мимо туннеля — иначе на полном туннеле сервер AZ уводит :53
+    # в свой 127.2.2.2, и хост остаётся без имён (модель «не отвечает»)
+    protect_resolvers
 
     _extra=""
     [ -f "$_dir/cred.txt" ] && _extra="--auth-user-pass $_dir/cred.txt"
 
     # --cd важен: сторонние провайдеры ссылаются на ca.crt/key из той же папки
+    # --ping 5/--ping-restart 12 + игнор серверных ping-опций: первая сессия к этому
+    # серверу иногда не проводит данные и висит до серверного ping-restart (30 с) —
+    # на полном туннеле это 30 с без интернета у всего хоста. Свои таймауты дают ~12 с.
+    # --explicit-exit-notify 1: при выключении честно сообщаем серверу, чтобы не
+    # оставалась мёртвая сессия с тем же CN (duplicate-cn на сервере включён).
     openvpn --cd "$_dir" --config "$_conf" --dev "$OVPN_DEV" --dev-type tun \
             $_extra --log "$DATA/ovpn.log" --writepid "$(ovpn_pid_file "$_id")" --daemon \
-            --script-security 2 --ping 10 --ping-restart 120 2>>"$DATA/ovpn.log" \
+            --script-security 2 --ping 5 --ping-restart 12 --explicit-exit-notify 1 \
+            --pull-filter ignore "ping-restart" --pull-filter ignore "ping" 2>>"$DATA/ovpn.log" \
         || { set_error "openvpn не запустился (см. журнал)"; return 1; }
 
     _i=0
@@ -191,6 +226,7 @@ wg_start() { # wg_start <id>
     rule_ensure mangle POSTROUTING -o "$WG0" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
     rule_ensure mangle OUTPUT -o "$WG0" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
     protect_lan
+    protect_resolvers
     log "wg[$_id]: up $(conf_get Address "$_conf")"
     return 0
 }
@@ -315,49 +351,80 @@ probe_direct() {
 }
 
 # --- DNS при полном туннеле -------------------------------------------------
-# В полном туннеле запросы к публичным резолверам уходят внутрь туннеля, а внешний
-# DNS там не отвечает — сервер остаётся без имён: сайты по IP открываются, а curl
-# падает. Поэтому DNS-запросы самого хоста (и host-network приложений) уводим в
-# резолвер туннеля, а контейнеры — через перехват в dnsmasq приложения.
-TUNNEL_DNS=${AZ_TUNNEL_DNS:-10.29.0.1}
+# Сервер в туннеле перехватывает DNS и отвечает своими адресами, по которым снаружи
+# ничего не открывается: сервер остаётся без имён (по IP всё работает, curl — нет).
+# Поэтому DNS-трафик хоста выводим мимо туннеля прямо в локальный шлюз: имена
+# получают настоящие адреса, а сам трафик идёт через туннель.
+DNS_MARK=0x53
+DNS_RT=53
 
 tunnel_dns_on() {
-    iptables -t nat -N VPN_DNS 2>/dev/null || true
+    lan_info
+    if [ -z "${LAN_GW:-}" ] || [ -z "${LAN_IF:-}" ]; then
+        log "dns: нет локального шлюза — DNS оставляю как есть"
+        return 1
+    fi
+    ip route replace default via "$LAN_GW" dev "$LAN_IF" table "$DNS_RT" 2>/dev/null
+    ip rule add fwmark "$DNS_MARK" lookup "$DNS_RT" priority 999 2>/dev/null || true
     for _p in udp tcp; do
-        iptables -t nat -C OUTPUT -p "$_p" --dport 53 -j VPN_DNS 2>/dev/null || \
-            iptables -t nat -A OUTPUT -p "$_p" --dport 53 -j VPN_DNS 2>/dev/null
+        iptables -t mangle -C OUTPUT -p "$_p" --dport 53 -j MARK --set-mark "$DNS_MARK" 2>/dev/null || \
+            iptables -t mangle -A OUTPUT -p "$_p" --dport 53 -j MARK --set-mark "$DNS_MARK" 2>/dev/null
     done
-    iptables -t nat -F VPN_DNS 2>/dev/null
-    iptables -t nat -A VPN_DNS -d 192.168.0.0/16 -j RETURN 2>/dev/null
-    iptables -t nat -A VPN_DNS -d 10.0.0.0/8 -j RETURN 2>/dev/null
-    iptables -t nat -A VPN_DNS -j DNAT --to-destination "$TUNNEL_DNS:53" 2>/dev/null
-    log "dns: DNS хоста -> резолвер туннеля $TUNNEL_DNS"
+    mkdir -p "$STATE"; echo "$LAN_GW" >"$STATE/dns_bypass"
+    log "dns: DNS хоста идёт мимо туннеля через $LAN_GW (имена — настоящие)"
 }
 
 tunnel_dns_off() {
+    for _p in udp tcp; do
+        while iptables -t mangle -D OUTPUT -p "$_p" --dport 53 -j MARK --set-mark "$DNS_MARK" 2>/dev/null; do :; done
+    done
+    while ip rule del fwmark "$DNS_MARK" lookup "$DNS_RT" priority 999 2>/dev/null; do :; done
+    ip route flush table "$DNS_RT" 2>/dev/null
+    # подчистить правила от прежней схемы (DNAT в резолвер туннеля), если остались
     for _p in udp tcp; do
         while iptables -t nat -D OUTPUT -p "$_p" --dport 53 -j VPN_DNS 2>/dev/null; do :; done
     done
     iptables -t nat -F VPN_DNS 2>/dev/null
     iptables -t nat -X VPN_DNS 2>/dev/null
+    rm -f "$STATE/dns_bypass" "$STATE/tunnel_dns"
 }
 
-# dns_probe — резолвится ли имя через резолвер туннеля (3 попытки по 5 с)
+# dns_probe — резолвится ли имя обычным путём (через локальный шлюз), 3 попытки по 5 с
 dns_probe() {
     _i=0
     while [ "$_i" -lt 3 ]; do
-        nslookup example.com "$TUNNEL_DNS" >/dev/null 2>&1 && return 0
+        nslookup example.com "${LAN_GW:-192.168.11.1}" >/dev/null 2>&1 && return 0
         sleep 5; _i=$((_i+1))
     done
     return 1
+}
+
+# снять мусор прошлых попыток: живой openvpn, адрес/маршруты/устройство туннеля.
+# Без этого следующая попытка упирается в "ip addr add ... File exists" и
+# "ERROR: Linux route add command failed" — и туннель формально поднят, но без трафика.
+tunnel_clean() {
+    pkill -f "openvpn.*--dev $OVPN_DEV" 2>/dev/null || true
+    rm -f "$STATE"/ovpn.*.pid
+    _i=0
+    while [ "$_i" -lt 10 ] && pgrep -f "openvpn.*--dev $OVPN_DEV" >/dev/null 2>&1; do
+        sleep 1; _i=$((_i+1))
+    done
+    for _d in "$OVPN_DEV" "$WG0"; do
+        ip link show "$_d" >/dev/null 2>&1 || continue
+        ip -4 route flush dev "$_d" 2>/dev/null || true
+        ip -4 addr flush dev "$_d" 2>/dev/null || true
+        ip link del "$_d" 2>/dev/null || true
+    done
 }
 
 stop_tunnel() { # снять всё, что относится к туннелю, не трогая выбор профиля
     _id=$(active_id)
     ovpn_stop "$_id"
     wg_stop
+    tunnel_clean
     dnat_off
     tunnel_dns_off
+    unprotect_resolvers
 }
 
 # connect <id> — поднять профиль с автооткатом
@@ -379,10 +446,9 @@ connect() {
     if dns_up; then dnat_wanted && dnat_on; else dnat_off; fi
     lan_access_wanted && lan_access_on
 
-    # полный туннель: без этого имена перестают резолвиться (внешний DNS в туннеле не отвечает)
-    if tunnel_is_default; then
-        tunnel_dns_on
-    fi
+    # DNS хоста НЕ трогаем, пока трафик через туннель не подтверждён: если туннель
+    # окажется мёртвым, хост и все host-network приложения (включая агента) остаются
+    # без имён на все 90 с пробы — именно это роняло сервер в цикле переподключений.
 
     # ждём, пока трафик реально пойдёт через туннель; иначе откат
     if tunnel_is_default; then
@@ -399,6 +465,8 @@ connect() {
             probe_direct || log "откат: прямой сети тоже нет!"
             return 1
         fi
+        # трафик через туннель подтверждён — только теперь уводим DNS хоста в туннель
+        tunnel_dns_on
         if ! dns_probe; then
             log "connect[$_id]: через туннель не резолвятся имена — откат"
             stop_tunnel
@@ -430,6 +498,48 @@ disconnect() {
     clear_active
     set_phase off
     log "disconnect: туннель выключен"
+}
+
+# --- автоподъём после перезагрузки -------------------------------------------
+# want_on ставится, когда пользователь включает туннель, и снимается при выключении:
+# именно он отличает «сервер перезагрузился» от «пользователь сам выключил VPN».
+want_on_set()   { mkdir -p "$STATE"; : > "$STATE/want_on"; : > "$STATE/autostart" ; }
+want_on_clear() { rm -f "$STATE/want_on" "$STATE/autostart" ; }
+
+# net_ready — есть default-маршрут и резолвятся имена (после ребута сеть поднимается не сразу)
+net_ready() {
+    [ -n "$(ip route show default 2>/dev/null)" ] || return 1
+    [ -n "$(resolve4 "api.deepseek.com" 2>/dev/null)" ] && return 0
+    [ -n "$(resolve4 "example.com" 2>/dev/null)" ] && return 0
+    return 1
+}
+
+resume() { # resume [id] — id передаёт app.py при автостарте, иначе берём активный профиль
+    if [ -n "${1:-}" ]; then
+        _id=$1
+    else
+        [ -f "$STATE/want_on" ] || { log "resume: автоподъём не нужен (туннель был выключен)"; return 0 ; }
+        _id=$(active_id)
+    fi
+    [ -n "$_id" ] || { log "resume: профиль не выбран — поднимать нечего"; return 0 ; }
+    [ "$(phase)" = on ] && [ -n "$(tun_dev)" ] && { log "resume: уже поднят"; return 0 ; }
+
+    _i=0
+    while [ "$_i" -lt 60 ]; do
+        net_ready && break
+        sleep 2; _i=$((_i+1))
+    done
+    [ "$_i" -lt 60 ] || { log "resume: сети нет за 120 с — автоподъём пропущен"; return 1 ; }
+
+    _t=0
+    while [ "$_t" -lt 3 ]; do
+        _t=$((_t+1))
+        log "resume: подъём профиля $_id (попытка $_t)"
+        connect "$_id" && { log "resume: туннель поднят автоматически"; return 0 ; }
+        sleep 15
+    done
+    log "resume: поднять $_id не удалось за 3 попытки"
+    return 1
 }
 
 # ---------------------------------------------------------------- супервизор
@@ -473,6 +583,14 @@ watch() {
             ;;
     esac
 
+    # страховка: перехват DNS хоста живёт только вместе с туннелем. Если туннель не
+    # поднят (упал контейнер в момент пробы, ovpn умер, откат) — правила снимаем,
+    # иначе хост остаётся без имён и «висит» весь сервер вместе с агентами.
+    if [ "$_ph" != connecting ] && [ -f "$STATE/tunnel_dns" ] && ! tunnel_is_default; then
+        tunnel_dns_off
+        log "watch: туннель не поднят — перехват DNS снят"
+    fi
+
     if [ "$_ph" = on ]; then
         ss -lnuH 2>/dev/null | grep -q ":$DNS_PORT " || dns_up || true
     fi
@@ -491,6 +609,7 @@ status() {
     esac
     echo "routes: $(ip -4 route show dev "$(tun_dev)" 2>/dev/null | wc -l)"
     echo "dns: $(ss -lnuH 2>/dev/null | grep -c ":$DNS_PORT ") -> $DNS_UPSTREAM (перехват: $(dnat_wanted && echo yes || echo no))"
+    echo "tunnel_dns: $(cat "$STATE/tunnel_dns" 2>/dev/null || echo none) -> правило $(iptables -t nat -S OUTPUT 2>/dev/null | grep -c VPN_DNS)"
     echo "lan_access: $(lan_access_wanted && echo yes || echo no)"
     lan_info; echo "lan: $LAN_IP/$LAN_IF/$LAN_GW net=$LAN_NET"
     echo "tunnel_ok: $(probe_tunnel && echo yes || echo no)"
@@ -498,18 +617,33 @@ status() {
 }
 
 case "${1:-up}" in
-    connect)     connect "${2:-}" ;;
+    connect)     want_on_set; connect "${2:-}" ;;
     disconnect)  disconnect ;;
+    forget)      want_on_clear; log "resume: намерение включения снято" ;;
+    resume)      resume "${2:-}" ;;
+    stop)        # снять туннель, но СОХРАНИТЬ намерение: для trap при остановке контейнера,
+                 # чтобы после старта resume поднял профиль обратно
+                 stop_tunnel; dns_down; set_phase off ;;
     up)          # совместимость: поднять активный профиль, если он был включён
                  if [ "$(phase)" = on ] && [ -n "$(active_id)" ]; then
                      [ -n "$(tun_dev)" ] || connect "$(active_id)" || true
                  fi ;;
-    down)        stop_tunnel; dns_down; set_phase off ;;
+    down)        want_on_clear; stop_tunnel; dns_down; set_phase off ;;
     watch)       watch ;;
+    guard)       # саморемонт при старте контейнера/по вызову: перехват DNS без живого туннеля не нужен
+                 if ! tunnel_is_default || [ "$(phase)" != on ]; then
+                     if [ -f "$STATE/tunnel_dns" ]; then
+                         tunnel_dns_off; echo "guard: перехват DNS снят (туннель не поднят)"
+                     else
+                         echo "guard: перехвата DNS нет — чисто"
+                     fi
+                 else
+                     echo "guard: туннель поднят — перехват оставлен"
+                 fi ;;
     dns)         _on=${2:-}; if [ "$_on" = off ]; then rm -f "$STATE/dns_on"; dnat_off; else \
                      mkdir -p "$STATE"; echo 1 > "$STATE/dns_on"; dns_up && dnat_on; fi ;;
     lan)         _on=${2:-}; if [ "$_on" = off ]; then rm -f "$STATE/lan_access"; lan_access_off; \
                      else mkdir -p "$STATE"; echo 1 > "$STATE/lan_access"; lan_access_on; fi ;;
     status)      status ;;
-    *)           echo "usage: net.sh connect <id>|disconnect|up|down|watch|dns on|off|lan on|off|status"; exit 2 ;;
+    *)           echo "usage: net.sh connect <id>|disconnect|resume|up|down|watch|dns on|off|lan on|off|status"; exit 2 ;;
 esac

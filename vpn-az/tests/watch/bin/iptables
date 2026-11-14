@@ -1,0 +1,36 @@
+#!/bin/sh
+# stateful-заглушка iptables: помнит правила в файлах, чтобы -C/-D вели себя как настоящие
+# (иначе tunnel_dns_off() крутится вечно: "удаляй, пока удаляется")
+ST="${IPT_STATE:-$PWD/iptstate}"
+mkdir -p "$ST"
+echo "IPT $*" >> "${LOG:-/dev/null}"
+
+tbl=mangle
+args=""
+skip=0
+op=""
+for a in "$@"; do
+    if [ "$skip" = 1 ]; then tbl=$a; skip=0; continue; fi
+    case "$a" in
+        -t) skip=1 ;;
+        -C|-D|-A|-I|-S|-F|-X) op=$a ;;
+        *) args="$args $a" ;;
+    esac
+done
+f="$ST/$tbl"
+spec=$(echo "$args" | sed 's/^ //')
+touch "$f"
+
+case "$op" in
+    -C) grep -Fxq -- "$spec" "$f" && exit 0 || exit 1 ;;
+    -D) if grep -Fxq -- "$spec" "$f"; then
+            awk -v s="$spec" 'BEGIN{done=0} {if(!done && $0==s){done=1; next} print}' "$f" >"$f.tmp" && mv "$f.tmp" "$f"
+            exit 0
+        fi
+        exit 1 ;;
+    -A|-I) echo "$spec" >> "$f"; exit 0 ;;
+    -S) cat "$f" ; exit 0 ;;
+    -F) : > "$f"; exit 0 ;;
+    -X) exit 0 ;;
+esac
+exit 0

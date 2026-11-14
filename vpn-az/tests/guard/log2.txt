@@ -1,0 +1,2 @@
+IP link show azvpn
+IP -4 route show dev azvpn
