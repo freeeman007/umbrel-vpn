@@ -1,0 +1,41 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0.35" y2="1">
+      <stop offset="0%" stop-color="#141a23"/>
+      <stop offset="55%" stop-color="#0e1116"/>
+      <stop offset="100%" stop-color="#0a0d11"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="0.5" cy="0.36" r="0.62">
+      <stop offset="0%" stop-color="#1d4a34" stop-opacity="0.55"/>
+      <stop offset="70%" stop-color="#1d4a34" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="disc" x1="0" y1="0" x2="0.4" y2="1">
+      <stop offset="0%" stop-color="#1f4433"/>
+      <stop offset="100%" stop-color="#142a20"/>
+    </linearGradient>
+    <linearGradient id="sh" x1="0" y1="0" x2="0.3" y2="1">
+      <stop offset="0%" stop-color="#ffffff"/>
+      <stop offset="100%" stop-color="#dfe7ee"/>
+    </linearGradient>
+  </defs>
+
+  <!-- подложка: скруглённый квадрат в цветах панели -->
+  <rect x="0" y="0" width="512" height="512" rx="118" ry="118" fill="url(#bg)"/>
+  <rect x="0" y="0" width="512" height="512" rx="118" ry="118" fill="url(#glow)"/>
+
+  <!-- зелёный круг-подложка -->
+  <circle cx="256" cy="252" r="190" fill="url(#disc)" stroke="#3ddc84" stroke-width="26"/>
+
+  <!-- щит -->
+  <path d="M256 372 C214 354 182 318 182 258 L182 176 C182 172 184 169 188 168
+           C216 159 238 152 254 146 C255 145 257 145 258 146 C274 152 296 159 324 168
+           C328 169 330 172 330 176 L330 258 C330 318 298 354 256 372 Z"
+        fill="url(#sh)"/>
+
+  <!-- замок -->
+  <path d="M230 268 v-16 a26 26 0 0 1 52 0 v16" fill="none" stroke="#0e1116" stroke-width="14"
+        stroke-linecap="round"/>
+  <rect x="214" y="266" width="84" height="62" rx="15" fill="#0e1116"/>
+  <circle cx="256" cy="290" r="7" fill="#3ddc84"/>
+  <rect x="252" y="294" width="8" height="17" rx="4" fill="#3ddc84"/>
+</svg>

@@ -1,8 +1,9 @@
 manifestVersion: 1
 id: vpn-az
+icon: https://raw.githubusercontent.com/freeeman007/umbrel-vpn/main/vpn-az/icon.png
 category: networking
 name: VPN AZ
-version: "3.4.1"
+version: "3.4.2"
 tagline: VPN-клиент с библиотекой профилей и включением в один тап
 description: >-
   Клиент к своему VPN-серверу прямо на Umbrel: библиотека профилей
@@ -37,6 +38,8 @@ port: 8666
 submitter: freeeman007
 submission: https://github.com/freeeman007/umbrel-vpn
 releaseNotes: >-
+  3.4.2 — у приложения появилась иконка: тёмный квадрат, зелёное кольцо, белый щит
+  с замком в цветах панели (лежит в репозитории, vpn-az/icon.png и icon.svg).
   3.4.1 — пояснения к функциям сервера больше не занимают место в карточке: текст спрятан под
   знаком «?» рядом с названием и всплывает при наведении курсора; на телефоне — по тапу, панелью
   снизу экрана. Тексты пояснений уточнены.
