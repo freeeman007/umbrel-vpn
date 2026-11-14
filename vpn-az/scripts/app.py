@@ -20,7 +20,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import urllib.request
 from urllib.parse import urlparse, parse_qs
 
-VERSION = "3.5.0"
+VERSION = "3.6.0"
 DATA = os.environ.get("DATA", "/data")
 PORT = int(os.environ.get("APP_PORT", "8666"))
 NET_SH = os.path.join(DATA, "net.sh")
@@ -446,6 +446,43 @@ def egress_loop():
         EGRESS_WAKE.clear()
 
 
+AUX_LOCK = threading.Lock()
+
+
+def dev_aux(pid, typ):
+    """Имя интерфейса доп. туннеля — должно совпадать с dev_aux в net.sh."""
+    s = re.sub(r"[^a-z0-9]", "", str(pid).lower())[:10] or "x"
+    return ("wg" if typ == "wireguard" else "azp") + s
+
+
+def dev_ip(dev):
+    out = run(["ip", "-4", "-o", "addr", "show", "dev", dev])
+    m = re.search(r"inet (\d+\.\d+\.\d+\.\d+)/", out)
+    return m.group(1) if m else ""
+
+
+def dev_routes(dev):
+    out = run(["ip", "-4", "route", "show", "dev", dev])
+    return [l.strip() for l in out.splitlines()
+            if l.strip() and not l.strip().startswith("default")]
+
+
+def aux_info():
+    """Доп. туннели: только маршруты к своим сетям, интернет через них не идёт."""
+    res = []
+    for pid in [l.strip() for l in read(os.path.join(STATE, "aux"), "").splitlines() if l.strip()]:
+        pr = profile(pid)
+        if not pr:
+            continue
+        typ = "wireguard" if pr.get("type") == "wireguard" else "openvpn"
+        dev = dev_aux(pid, typ)
+        ip = dev_ip(dev)
+        res.append({"id": pid, "name": pr.get("name") or pid,
+                    "type": pr.get("type"), "dev": dev, "ip": ip,
+                    "up": bool(ip), "routes": dev_routes(dev)})
+    return res
+
+
 def status():
     ph = phase()
     aid = state("active")
@@ -473,6 +510,7 @@ def status():
         "autostart": os.path.exists(os.path.join(STATE, "autostart")),
         "warn": state("warn"),
         "lan": {"nat": os.path.exists(os.path.join(STATE, "lan_access"))},
+        "aux": aux_info(),
         "egress": EGRESS,
         "direct_ok": probe_direct(),
         "tg": {"enabled": tg_enabled(), "configured": bool(tg_conf().get("token")),
@@ -623,13 +661,20 @@ def tg_text(reason):
         "адрес в туннеле: %s" % ip,
         "LAN: %s" % lan,
         "выход в интернет: %s" % eg,
+    ]
+    for a in aux_info():
+        if a.get("up"):
+            lines.append("доп. туннель: %s — %s (%d маршр.)"
+                         % (a["name"], a["ip"], len(a.get("routes") or [])))
+    lines += [
         "",
         "Ссылки:",
     ]
     for name, url, _port in links:
         lines.append("%s — %s" % (name, url))
-    return "\n".join(lines), "%s|%s|%s|%s|%s" % (
-        ip, lan, eg, prof, ",".join(str(x[2]) for x in links))
+    _aux = ",".join("%s=%s" % (a["id"], a["ip"]) for a in aux_info() if a.get("up"))
+    return "\n".join(lines), "%s|%s|%s|%s|%s|%s" % (
+        ip, lan, eg, prof, ",".join(str(x[2]) for x in links), _aux)
 
 
 def tg_report(reason="подключено", force=False, tries=1, gap=8):
@@ -689,6 +734,26 @@ def tg_report_later(reason, delay=3.0, tries=1):
         except Exception:  # noqa: BLE001
             pass
     threading.Thread(target=_run, daemon=True).start()
+
+
+def do_aux(pid, on):
+    """Поднять/снять доп. туннель (только маршруты к его сетям)."""
+    if not AUX_LOCK.acquire(blocking=False):
+        return
+    try:
+        if on:
+            if phase() != "on":
+                write(os.path.join(STATE, "warn"), "сначала включи основной туннель — доп. работает поверх него")
+                return
+            if os.path.exists(os.path.join(STATE, "error")):
+                os.remove(os.path.join(STATE, "error"))
+            net("aux", "up", pid, timeout=180)
+            if phase() == "on":
+                tg_report_later("доп. туннель", delay=1.0, tries=3)
+        else:
+            net("aux", "off", pid, timeout=60)
+    finally:
+        AUX_LOCK.release()
 
 
 def do_connect(pid):
@@ -903,6 +968,8 @@ display:flex;align-items:center;gap:7px}
 background:#161a21;margin-bottom:8px;cursor:pointer;transition:border-color .15s}
 .prof:hover{border-color:#33405a}
 .prof.sel{border-color:#3ddc84;background:#132219}
+.prof.aux{border-color:#2e4a3a}
+.ico.on{color:#3ddc84;border-color:#2f5340;background:#14261b}
 .dot{width:9px;height:9px;border-radius:50%;background:#2f3746;flex:0 0 9px}
 .prof.sel .dot{background:#3ddc84;box-shadow:0 0 8px #3ddc84}
 .pname{font-weight:600;font-size:14px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
@@ -983,6 +1050,8 @@ transition:opacity .13s ease,transform .13s ease,visibility .13s}
 <div class="ph">WireGuard</div>
 <div id="profiles-wg"></div>
 <button class="ghost" onclick="openImport('wireguard')">+ Добавить WireGuard</button>
+<div class="hint">Кнопка «+» на карточке подключает профиль как дополнительный туннель: в него
+уходят только его сети (корпоративная и т.п.), интернет остаётся у основного профиля.</div>
 
 <div class="sec">Сервис</div>
 <div class="card">
@@ -1086,13 +1155,18 @@ function render(){
   const list=S.profiles||[];
   function profCard(x){
     const sel=x.id===S.active_id;
-    const meta=(x.full_tunnel?'весь трафик · ':'')+
+    const ax=(S.aux||[]).filter(function(a){return a.id===x.id;})[0];
+    let meta=(x.full_tunnel?'весь трафик · ':'')+
       (x.remotes&&x.remotes.length?x.remotes[0]+' ':'')+
       (x.missing&&x.missing.length?'нет файлов: '+x.missing.join(','):'');
-    return '<div class="prof'+(sel?' sel':'')+'" data-id="'+esc(x.id)+'">'+
+    if(ax) meta=(ax.up?'доп. туннель '+ax.ip+' · ':'доп. туннель (поднимается) · ')+meta;
+    const plus=(x.full_tunnel||sel)?'':'<button class="ico'+(ax?' on':'')+'" data-act="aux" title="'+
+      (ax?'Отключить доп. туннель':'Подключить как доп.: в него уйдут только его сети, интернет останется у основного')+
+      '">'+(ax?'−':'+')+'</button>';
+    return '<div class="prof'+(sel?' sel':'')+(ax?' aux':'')+'" data-id="'+esc(x.id)+'">'+
       '<span class="dot"></span><div style="min-width:0"><div class="pname">'+esc(x.name)+'</div>'+
       '<div class="pmeta">'+esc(meta)+'</div></div>'+
-      '<div class="acts"><button class="ico" data-act="ren" title="Переименовать">✎</button>'+
+      '<div class="acts">'+plus+'<button class="ico" data-act="ren" title="Переименовать">✎</button>'+
       '<button class="ico" data-act="del" title="Удалить">✕</button></div></div>';
   }
   function paintProfiles(boxId, arr, empty){
@@ -1107,6 +1181,13 @@ function render(){
         e.stopPropagation(); askRename(id,(pr&&pr.name)||''); });
       el.querySelector('[data-act="del"]').addEventListener('click',function(e){
         e.stopPropagation(); del(id); });
+      const ab=el.querySelector('[data-act="aux"]');
+      if(ab) ab.addEventListener('click',function(e){
+        e.stopPropagation();
+        const on=!!(S.aux||[]).filter(function(a){return a.id===id;})[0];
+        fetch('/api/'+(on?'aux_off':'aux_on')+'?id='+encodeURIComponent(id),{method:'POST',credentials:'same-origin'})
+          .then(function(){ load(); });
+      });
     });
   }
   paintProfiles('profiles-ovpn', list.filter(function(x){return x.type==='openvpn';}),
@@ -1337,6 +1418,19 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(404, json.dumps({"error": "нет такого профиля"}))
             threading.Thread(target=do_connect, args=(pid,), daemon=True).start()
             return self._send(200, json.dumps({"ok": True, "phase": "connecting"}))
+
+        if u.path in ("/api/aux_on", "/api/aux_off"):
+            pid = (q.get("id") or [""])[0]
+            if not pid and body:
+                try:
+                    pid = (json.loads(body.decode()) or {}).get("id", "")
+                except Exception:  # noqa: BLE001
+                    pid = ""
+            if not profile(pid):
+                return self._send(404, json.dumps({"error": "нет такого профиля"}))
+            threading.Thread(target=do_aux, args=(pid, u.path.endswith("aux_on")),
+                             daemon=True).start()
+            return self._send(200, json.dumps({"ok": True}))
 
         if u.path == "/api/disconnect":
             threading.Thread(target=do_disconnect, daemon=True).start()

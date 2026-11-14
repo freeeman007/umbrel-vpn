@@ -71,7 +71,7 @@ lan_info() {
     LAN_IP=""; LAN_IF=""; LAN_GW=""; LAN_PREFIX=24; LAN_NET=""
     for _n in /sys/class/net/*; do
         _i=$(basename "$_n")
-        case "$_i" in lo|azvpn|wg0|tun*|tap*|docker*|veth*|br-*|virbr*) continue ;;
+        case "$_i" in lo|azvpn|azp*|wg*|tun*|tap*|docker*|veth*|br-*|virbr*) continue ;;
         esac
         _a=$(ip -4 -o addr show dev "$_i" 2>/dev/null | sed -n 's/.* inet \([0-9.]*\)\/\([0-9]*\).*/\1 \2/p' | head -1)
         [ -n "$_a" ] || continue
@@ -223,6 +223,7 @@ wg_start() { # wg_start <id>
     _ep_host=${_ep%:*}
     _ep_ip=$(resolve4 "$_ep_host"); [ -n "$_ep_ip" ] || _ep_ip=$_ep_host
     [ -n "$_ep_ip" ] && [ -n "${LAN_GW:-}" ] && ip route replace "$_ep_ip/32" via "$LAN_GW" dev "$LAN_IF" 2>/dev/null
+    _def0=$(ip -4 route show default | head -1)
     _awg=0
     grep -qE "$AWG_RE" "$_conf" 2>/dev/null && _awg=1
     grep -vE '^[[:space:]]*(Address|DNS|MTU)[[:space:]]*=' "$_conf" | grep -vE "$AWG_RE" > /run/wg0.strip
@@ -262,6 +263,180 @@ wg_start() { # wg_start <id>
     fi
     log "wg[$_id]: up $(conf_get Address "$_conf"), рукопожатие есть"
     return 0
+}
+
+# ---------------------------------------------------------------- доп. туннели
+# Второй и следующие профили нужны только ради маршрутов к своим сетям
+# (корпоративная, домашняя и т.п.). Интернет всегда идёт через основной профиль:
+# здесь default не ставится, DNS хоста не трогается, NAT и kill-switch относятся
+# только к основному туннелю.
+dev_aux() { # dev_aux <id> <type>
+    _s=$(printf '%s' "$1" | tr 'A-Z' 'a-z' | tr -cd 'a-z0-9' | cut -c1-10)
+    [ -n "$_s" ] || _s="x"
+    if [ "$2" = wg ]; then printf 'wg%s' "$_s" ; else printf 'azp%s' "$_s" ; fi
+}
+aux_list()  { [ -f "$STATE/aux" ] && grep -v '^[[:space:]]*$' "$STATE/aux" ; }
+aux_has()   { aux_list 2>/dev/null | grep -Fqx "$1" ; }
+aux_add()   { mkdir -p "$STATE"; aux_has "$1" || printf '%s\n' "$1" >> "$STATE/aux" ; }
+aux_del()   { mkdir -p "$STATE"; aux_list 2>/dev/null | grep -Fvx "$1" > "$STATE/aux.tmp"; \
+              mv "$STATE/aux.tmp" "$STATE/aux" 2>/dev/null ; }
+aux_clear() { rm -f "$STATE/aux" ; }
+aux_ip()    { ip -4 -o addr show dev "$1" 2>/dev/null | sed -n 's/.* inet \([0-9.]*\)\/.*/\1/p' | head -1 ; }
+
+# Сервер может прислать redirect-gateway или маршруты 0.0.0.0/1+128.0.0.0/1 даже
+# в «сплит»-профиле. У доп. туннеля default быть не должно: интернет идёт через
+# основной. Такие маршруты снимаем и, если default пропал совсем, возвращаем прежний.
+aux_strip_default() { # aux_strip_default <dev> <прежний default>
+    _d=$1; _prev=$2
+    for _r in default 0.0.0.0/1 128.0.0.0/1; do
+        ip -4 route show "$_r" dev "$_d" 2>/dev/null | grep -q . || continue
+        ip -4 route del "$_r" dev "$_d" 2>/dev/null && log "aux[$_d]: убран $_r (интернет остаётся у основного туннеля)"
+    done
+    if [ -z "$(ip -4 route show default 2>/dev/null)" ] && [ -n "$_prev" ]; then
+        ip -4 route replace $_prev 2>/dev/null && log "aux[$_d]: прежний default возвращён"
+    fi
+}
+aux_routes() { ip -4 route show dev "$1" 2>/dev/null | grep -v '^default' | wc -l ; }
+
+# dev_alive — интерфейс существует и (для ovpn) процесс жив
+aux_alive() { # aux_alive <id>
+    _t=$(prof_type "$1"); _d=$(dev_aux "$1" "$_t")
+    ip link show "$_d" >/dev/null 2>&1 || return 1
+    [ -n "$(aux_ip "$_d")" ] || return 1
+    return 0
+}
+
+aux_ovpn_up() {
+    _id=$1; _dir=$(prof_dir "$_id"); _conf=$(prof_conf "$_id"); _dev=$(dev_aux "$_id" ovpn)
+    [ -f "$_conf" ] || { set_warn "нет конфига в профиле"; return 1; }
+    lan_info
+    _ep=$(sed -n 's/^[[:space:]]*remote[[:space:]]\+\([^[:space:]]\+\)[[:space:]]\+\([0-9]\+\).*/\1 \2/p' "$_conf" | head -1)
+    _ep_host=$(echo "$_ep" | cut -d' ' -f1)
+    _ep_ip=$(resolve4 "$_ep_host"); [ -n "$_ep_ip" ] || _ep_ip=$_ep_host
+    [ -n "$_ep_ip" ] && [ -n "${LAN_GW:-}" ] && ip route replace "$_ep_ip/32" via "$LAN_GW" dev "$LAN_IF" 2>/dev/null
+    protect_resolvers
+    _def0=$(ip -4 route show default | head -1)
+    _extra=""
+    [ -f "$_dir/cred.txt" ] && _extra="--auth-user-pass $_dir/cred.txt"
+    # redirect-gateway и dhcp-option от сервера отбрасываем: default и DNS остаются
+    # у основного туннеля, а push'и нумерации («route 10.0.0.0/8») применяются как есть
+    openvpn --cd "$_dir" --config "$_conf" --dev "$_dev" --dev-type tun \
+            $_extra --log "$DATA/ovpn.log" --writepid "$STATE/ovpnx.$_id.pid" --daemon \
+            --script-security 2 --ping 5 --ping-restart 12 --explicit-exit-notify 1 \
+            --pull-filter ignore "ping-restart" --pull-filter ignore "ping" \
+            --pull-filter ignore "redirect-gateway" --pull-filter ignore "dhcp-option" \
+            2>>"$DATA/ovpn.log" \
+        || { set_warn "openvpn (доп. $_id) не запустился (см. журнал)"; return 1; }
+    _i=0
+    while [ "$_i" -lt 45 ]; do
+        [ -n "$(aux_ip "$_dev")" ] && break
+        sleep 1; _i=$((_i+1))
+    done
+    [ -n "$(aux_ip "$_dev")" ] || { set_warn "доп. туннель $_id не получил адрес (сервер недоступен или ошибка в профиле)"; return 1; }
+    rule_ensure mangle POSTROUTING -o "$_dev" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+    rule_ensure mangle OUTPUT -o "$_dev" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+    protect_lan
+    aux_strip_default "$_dev" "$_def0"
+    log "aux[$_id]: up $(aux_ip "$_dev") на $_dev, маршрутов $(aux_routes "$_dev")"
+    return 0
+}
+
+aux_wg_up() {
+    _id=$1; _conf=$(prof_conf "$_id"); _dev=$(dev_aux "$_id" wg)
+    [ -f "$_conf" ] || { set_warn "нет конфига в профиле"; return 1; }
+    lan_info
+    ip link show "$_dev" >/dev/null 2>&1 || ip link add dev "$_dev" type wireguard \
+        || { set_warn "не создаётся $_dev"; return 1; }
+    _addr=$(conf_get Address "$_conf")
+    _mtu=$(conf_get MTU "$_conf"); [ -n "$_mtu" ] || _mtu=1420
+    _ep=$(conf_get Endpoint "$_conf"); _ep_host=${_ep%:*}
+    _ep_ip=$(resolve4 "$_ep_host"); [ -n "$_ep_ip" ] || _ep_ip=$_ep_host
+    [ -n "$_ep_ip" ] && [ -n "${LAN_GW:-}" ] && ip route replace "$_ep_ip/32" via "$LAN_GW" dev "$LAN_IF" 2>/dev/null
+    grep -vE '^[[:space:]]*(Address|DNS|MTU)[[:space:]]*=' "$_conf" | grep -vE "$AWG_RE" > "/run/$_dev.strip"
+    if ! _werr=$(wg setconf "$_dev" "/run/$_dev.strip" 2>&1); then
+        set_warn "wg setconf ($_id): $(printf '%s' "$_werr" | head -2 | tr '\n' ' ')"
+        ip link del "$_dev" 2>/dev/null; return 1
+    fi
+    echo "$_addr" | grep -q '/' || _addr="$_addr/32"
+    ip -4 addr show dev "$_dev" | grep -q " ${_addr%/*}/" || ip -4 addr add "$_addr" dev "$_dev"
+    # маршруты — только конкретные сети: 0.0.0.0/0 здесь означал бы «интернет-профиль»
+    conf_get AllowedIPs "$_conf" | tr ',' '\n' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | grep -v '^$' \
+        | grep -vE '^(0\.0\.0\.0/0|0\.0\.0\.0/1|128\.0\.0\.0/1|::/0)$' \
+        | sed "s|^|route replace |; s|\$| dev $_dev|" > "/run/$_dev.routes"
+    if [ ! -s "/run/$_dev.routes" ]; then
+        ip link del "$_dev" 2>/dev/null
+        set_warn "в профиле $_id нет сетей кроме 0.0.0.0/0 — это интернет-профиль, его подключают кнопкой питания, а не как дополнительный"
+        return 1
+    fi
+    ip link set mtu "$_mtu" up dev "$_dev" || { set_warn "$_dev не поднимается"; return 1; }
+    ip -4 -batch "/run/$_dev.routes" >/dev/null 2>&1 || log "aux[$_id]: часть маршрутов не применилась"
+    rule_ensure mangle POSTROUTING -o "$_dev" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+    rule_ensure mangle OUTPUT -o "$_dev" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+    protect_lan
+    _i=0; _hs=0
+    while [ "$_i" -lt 15 ]; do
+        _hs=$(wg show "$_dev" latest-handshakes 2>/dev/null | awk 'NR==1{print $2+0}')
+        [ "${_hs:-0}" -gt 0 ] && break
+        sleep 1; _i=$((_i+1))
+    done
+    if [ "${_hs:-0}" -le 0 ]; then
+        set_warn "WireGuard ($_id) не получил рукопожатие за 15 с: $_ep не отвечает или ключи не подходят"
+        ip -4 route flush dev "$_dev" 2>/dev/null; ip link del "$_dev" 2>/dev/null
+        return 1
+    fi
+    aux_strip_default "$_dev" "$_def0"
+    log "aux[$_id]: up $_addr на $_dev, маршрутов $(aux_routes "$_dev")"
+    return 0
+}
+
+aux_up() { # aux_up <id> — поднять профиль как дополнительный (только маршруты)
+    _id=$1
+    [ -n "$_id" ] || { set_warn "профиль не выбран"; return 1; }
+    _t=$(prof_type "$_id")
+    [ "$_t" = none ] && { set_warn "в профиле нет .ovpn или .conf"; return 1; }
+    if [ "$_id" = "$(active_id)" ]; then
+        set_warn "этот профиль уже подключён как основной — он и так работает"
+        return 1
+    fi
+    if full_tunnel "$_id"; then
+        set_warn "это профиль «весь трафик»: дополнительным он забрал бы интернет у основного. Подключай его кнопкой питания"
+        return 1
+    fi
+    aux_alive "$_id" && { aux_add "$_id"; log "aux[$_id]: уже поднят"; return 0; }
+    aux_add "$_id"
+    case "$_t" in
+        ovpn) aux_ovpn_up "$_id" || { aux_forget "$_id"; return 1 ;} ;;
+        wg)   aux_wg_up   "$_id" || { aux_forget "$_id"; return 1 ;} ;;
+    esac
+    return 0
+}
+
+aux_down() { # aux_down <id>
+    _id=$1; [ -n "$_id" ] || return 0
+    _t=$(prof_type "$_id"); _dev=$(dev_aux "$_id" "$_t")
+    pkill -f "openvpn.*--dev $_dev" 2>/dev/null || true
+    rm -f "$STATE/ovpnx.$_id.pid"
+    rule_del mangle POSTROUTING -o "$_dev" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+    rule_del mangle OUTPUT -o "$_dev" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+    ip -4 route flush dev "$_dev" 2>/dev/null || true
+    ip -4 addr flush dev "$_dev" 2>/dev/null || true
+    ip link del "$_dev" 2>/dev/null || true
+    log "aux[$_id]: снят"
+}
+
+aux_forget() { aux_down "$1"; aux_del "$1" ; }
+
+aux_all_down() { for _a in $(aux_list 2>/dev/null); do aux_down "$_a"; done ; }
+aux_forget_all() { for _a in $(aux_list 2>/dev/null); do aux_forget "$_a"; done ; }
+
+# reup — поднять все дополнительные профили, которые были включены (после основного)
+aux_reup() {
+    aux_list 2>/dev/null | while read -r _a; do
+        [ -n "$_a" ] || continue
+        aux_alive "$_a" && continue
+        log "aux: возвращаю $_a"
+        aux_up "$_a" || log "aux: $_a не поднялся"
+    done
 }
 
 # ---------------------------------------------------------------- DNS
@@ -548,10 +723,13 @@ connect() {
     set_since "$(date +%s)"
     set_phase on
     log "connect[$_id]: подключено ($_type)"
+    # дополнительные туннели (корпоративные сети и т.п.) возвращаем после основного
+    aux_reup 2>/dev/null || true
     return 0
 }
 
 disconnect() {
+    aux_all_down
     stop_tunnel
     clear_active
     set_phase off
@@ -651,6 +829,11 @@ watch() {
 
     if [ "$_ph" = on ]; then
         ss -lnuH 2>/dev/null | grep -q ":$DNS_PORT " || dns_up || true
+        # доп. туннели: устройство пропало — поднимаем заново (не чаще раза в цикл)
+        for _a in $(aux_list 2>/dev/null); do
+            [ -n "$_a" ] || continue
+            aux_alive "$_a" || { log "watch: доп. туннель $_a пропал — поднимаю"; aux_up "$_a" || true; }
+        done
     fi
 }
 
@@ -671,6 +854,10 @@ status() {
     echo "tunnel_dns: $(cat "$STATE/tunnel_dns" 2>/dev/null || echo none) -> правило $(iptables -t nat -S OUTPUT 2>/dev/null | grep -c VPN_DNS)"
     echo "lan_access: $(lan_access_wanted && echo yes || echo no)"
     lan_info; echo "lan: $LAN_IP/$LAN_IF/$LAN_GW net=$LAN_NET"
+    for _a in $(aux_list 2>/dev/null); do
+        _at=$(prof_type "$_a"); _ad=$(dev_aux "$_a" "$_at")
+        echo "aux: $_a|$_at|$_ad|$(aux_ip "$_ad")|$(aux_routes "$_ad")|$(aux_alive "$_a" && echo up || echo down)"
+    done
     echo "tunnel_ok: $(probe_tunnel && echo yes || echo no)"
     echo "direct_ok: $(probe_direct && echo yes || echo no)"
 }
@@ -703,6 +890,17 @@ case "${1:-up}" in
                      mkdir -p "$STATE"; echo 1 > "$STATE/dns_on"; dns_up && dnat_on; fi ;;
     lan)         _on=${2:-}; if [ "$_on" = off ]; then rm -f "$STATE/lan_access"; lan_access_off; \
                      else mkdir -p "$STATE"; echo 1 > "$STATE/lan_access"; lan_access_on; fi ;;
+    aux)         # aux up <id> | aux off <id> | aux list
+                 _cmd=${2:-list}
+                 case "$_cmd" in
+                     up)   aux_up "${3:-}" ;;
+                     off)  aux_forget "${3:-}" ;;
+                     list) for _a in $(aux_list 2>/dev/null); do
+                               _at=$(prof_type "$_a"); _ad=$(dev_aux "$_a" "$_at")
+                               echo "$_a|$_at|$_ad|$(aux_ip "$_ad")|$(aux_routes "$_ad")"
+                           done ;;
+                     *)    echo "usage: net.sh aux up <id>|off <id>|list"; exit 2 ;;
+                 esac ;;
     status)      status ;;
-    *)           echo "usage: net.sh connect <id>|disconnect|resume|up|down|watch|dns on|off|lan on|off|status"; exit 2 ;;
+    *)           echo "usage: net.sh connect <id>|disconnect|resume|up|down|watch|aux up|off <id>|aux list|dns on|off|lan on|off|status"; exit 2 ;;
 esac
