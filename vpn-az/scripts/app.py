@@ -20,7 +20,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import urllib.request
 from urllib.parse import urlparse, parse_qs
 
-VERSION = "3.6.3"
+VERSION = "3.7.2"
 DATA = os.environ.get("DATA", "/data")
 PORT = int(os.environ.get("APP_PORT", "8666"))
 NET_SH = os.path.join(DATA, "net.sh")
@@ -600,8 +600,9 @@ def lan_addrs():
         if len(f) < 4:
             continue
         iface, cidr = f[1], f[3]
-        if iface == "lo" or iface.startswith(("azvpn", "tun", "wg", "docker", "br-", "veth", "tap",
-                                             "umbrel-vm", "kube", "lxc")):
+        # azp*/wg* — устройства доп. туннелей, это не локальная сеть
+        if iface == "lo" or iface.startswith(("azvpn", "azp", "tun", "wg", "docker", "br-", "veth",
+                                             "tap", "umbrel-vm", "kube", "lxc")):
             continue
         res.append("%s (%s)" % (cidr, iface))
     return res
@@ -658,6 +659,20 @@ def app_links(ip):
     return items
 
 
+def profile_full(pid):
+    """Профиль целиком: метаданные + текст конфига — для карточки просмотра."""
+    p = profile(pid)
+    if not p:
+        return None
+    return {
+        "id": pid, "name": p["name"], "type": p["type"],
+        "config": p["config"], "text": read(find_conf(pid), ""),
+        "full_tunnel": p["full_tunnel"], "remotes": p["remotes"],
+        "has_pass": p["has_pass"], "has_creds": p["has_creds"],
+        "files": p["files"], "missing": p["missing"],
+    }
+
+
 def tg_text(reason):
     st = status()
     tun = st.get("tunnel") or {}
@@ -668,22 +683,23 @@ def tg_text(reason):
     mode = "весь трафик" if tun.get("default_via_tunnel") else "split"
     links = app_links(ip)
     lines = [
-        "VPN · Umbrel — %s" % reason,
-        "профиль: %s (%s)" % (prof, mode),
-        "адрес в туннеле: %s" % ip,
-        "LAN: %s" % lan,
-        "выход в интернет: %s" % eg,
+        "🛡 VPN · Umbrel — %s" % reason,
+        "🔌 профиль: %s (%s)" % (prof, mode),
+        "🌐 адрес в туннеле: %s" % ip,
+        "🏠 LAN: %s" % lan,
+        "🚀 выход в интернет: %s" % eg,
     ]
     for a in aux_info():
         if a.get("up"):
-            lines.append("доп. туннель: %s — %s (%d маршр.)"
+            lines.append("🔗 доп. туннель: %s — %s (%d маршр.)"
                          % (a["name"], a["ip"], len(a.get("routes") or [])))
     lines += [
         "",
-        "Ссылки:",
+        "📋 Ссылки:",
     ]
-    for name, url, _port in links:
-        lines.append("%s — %s" % (name, url))
+    for name, url, port in links:
+        icon = "🖥" if port == 80 else ("🎛" if name.lower().startswith("vpn") else "📦")
+        lines.append("%s %s — %s" % (icon, name, url))
     _aux = ",".join("%s=%s" % (a["id"], a["ip"]) for a in aux_info() if a.get("up"))
     return "\n".join(lines), "%s|%s|%s|%s|%s|%s" % (
         ip, lan, eg, prof, ",".join(str(x[2]) for x in links), _aux)
@@ -982,6 +998,18 @@ background:#161a21;margin-bottom:8px;cursor:pointer;transition:border-color .15s
 .prof.sel{border-color:#3ddc84;background:#132219}
 .prof.aux{border-color:#2e4a3a}
 .ico.on{color:#3ddc84;border-color:#2f5340;background:#14261b}
+.pick{display:flex;align-items:center;gap:9px;padding:8px 10px;border-radius:9px;border:1px solid #232936;
+background:#12161d;margin-bottom:6px;font-size:13px;cursor:pointer}
+.pick.on{border-color:#3ddc84;background:#132219}
+.pick .nm{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.pick .tp{font-size:11px;color:#7d8698}
+.arow{display:flex;align-items:center;gap:10px;padding:9px 0;border-bottom:1px solid #1e242e;font-size:13px}
+.arow:last-child{border-bottom:0}
+.arow .an{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.arow .ad{font-size:11px;color:#7d8698}
+.badge{font-size:11px;padding:2px 7px;border-radius:7px;background:#20262f;color:#8a94a6}
+.badge.ok{background:#14301f;color:#5fdc94}
+.badge.bad{background:#331c1c;color:#e08585}
 .dot{width:9px;height:9px;border-radius:50%;background:#2f3746;flex:0 0 9px}
 .prof.sel .dot{background:#3ddc84;box-shadow:0 0 8px #3ddc84}
 .pname{font-weight:600;font-size:14px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
@@ -1065,10 +1093,16 @@ transition:opacity .13s ease,transform .13s ease,visibility .13s}
 <div class="hint">Кнопка «+» на карточке подключает профиль как дополнительный туннель: в него
 уходят только его сети (корпоративная и т.п.), интернет остаётся у основного профиля.</div>
 
+<div class="sec">Доп. туннели</div>
+<div class="card">
+  <div id="auxrows"></div>
+  <div class="hint" id="auxempty">Не подключены. Нажми «+» на карточке профиля.</div>
+</div>
+
 <div class="sec">Сервис</div>
 <div class="card">
   <div class="row"><span class="k kw"><span>Перехват DNS всех приложений</span><span class="q" tabindex="0" role="button" aria-label="Пояснение: перехват DNS" data-tip="Все запросы на порт 53 (UDP и TCP) от приложений Umbrel уходят в локальный резолвер Umbrel, а он спрашивает 1.1.1.1 напрямую, мимо туннеля. Спасает, когда VPN-сервер перехватывает DNS и отдаёт адреса, по которым ничего не открывается. DoH/DoT (порты 443 и 853) не трогает.">?</span></span><div class="sw" id="swdns" onclick="setOpt('dns')"></div></div>
-  <div class="row"><span class="k kw"><span>Автоподключение при старте</span><span class="q" tabindex="0" role="button" aria-label="Пояснение: автоподключение при старте" data-tip="Поднимать выбранный профиль сам после перезагрузки Umbrel или перезапуска приложения. Туннель, выключенный вручную, сам не включится.">?</span></span><div class="sw" id="swauto" onclick="setOpt('auto')"></div></div>
+  <div class="row"><span class="k kw"><span>Автоподключение при старте</span><span class="q" tabindex="0" role="button" aria-label="Пояснение: автоподключение при старте" data-tip="Поднимать выбранный профиль сам после перезагрузки Umbrel или перезапуска приложения. Туннель, выключенный вручную, сам не включится.">?</span></span><span style="display:flex;align-items:center;gap:10px"><button class="mini" title="Что поднимать при старте" onclick="asOpen()">&#9881;</button><div class="sw" id="swauto" onclick="setOpt('auto')"></div></span></div>
   <div class="row"><span class="k kw"><span>NAT в домашнюю сеть</span><span class="q" tabindex="0" role="button" aria-label="Пояснение: NAT в домашнюю сеть" data-tip="Маскарад для клиентов VPN в локальную сеть этого Umbrel: телефон из VPN сможет зайти на NAS, принтер, веб-морду роутера. Маршрут к локальной подсети клиент должен знать сам — её актуальное значение приходит в уведомлении Telegram, строка LAN.">?</span></span><div class="sw" id="swlan" onclick="setOpt('lan')"></div></div>
   <div class="row"><span class="k kw"><span>Уведомления в Telegram</span><span class="q" tabindex="0" role="button" aria-label="Пояснение: уведомления в Telegram" data-tip="После подключения и после запуска сервера присылает в Telegram адрес в туннеле, LAN-адрес, внешний IP и ссылки на все приложения Umbrel — по ним видно, куда заходить с телефона. Одинаковые адреса дважды не отправляются.">?</span></span><span style="display:flex;align-items:center;gap:10px"><button class="mini" title="Настройки уведомлений" onclick="tgSetup()">&#9881;</button><div class="sw" id="swtg" onclick="setOpt('tg')"></div></span></div>
 </div>
@@ -1076,17 +1110,57 @@ transition:opacity .13s ease,transform .13s ease,visibility .13s}
 <button class="ghost" onclick="diag()">Диагностика и журнал</button>
 <button class="ghost" onclick="tgTest()">Проверить уведомление</button>
 
+<dialog id="pdlg">
+  <h2 id="pdt">Профиль</h2>
+  <div class="hint" id="pdmeta" style="margin:0 0 10px"></div>
+  <label>Название</label>
+  <input type="text" id="pdname" autocomplete="off">
+  <div id="pdcreds" style="display:none">
+    <label>Логин и пароль (если требует провайдер)</label>
+    <input type="text" id="pduser" placeholder="логин" autocomplete="off">
+    <input type="password" id="pdpass" placeholder="пароль (пусто — не менять)" autocomplete="new-password">
+  </div>
+  <div id="pdkey" style="display:none">
+    <label>Пароль ключа (пусто — не менять)</label>
+    <input type="password" id="pdkp" autocomplete="off">
+  </div>
+  <label>Конфиг</label>
+  <textarea id="pdtext" style="min-height:190px" spellcheck="false"></textarea>
+  <button class="primary" onclick="pdSave()">Сохранить</button>
+  <button class="ghost" style="margin-top:8px" onclick="pdConnect()">Подключить основным</button>
+  <button class="ghost" id="pdauxb" style="margin-top:8px" onclick="pdAux()">Подключить доп. туннелем</button>
+  <button class="ghost" style="margin-top:8px" onclick="document.getElementById('pdlg').close()">Закрыть</button>
+  <pre id="pdout"></pre>
+</dialog>
+
+<dialog id="asdlg">
+  <h2>Автоподключение при старте</h2>
+  <div class="hint" style="margin:0 0 10px">Что поднимать после перезагрузки Umbrel или перезапуска
+  приложения. Основной профиль даёт интернет, доп. туннели — только свои сети.</div>
+  <label>Основной профиль</label>
+  <div id="asprimary"></div>
+  <label>Доп. туннели</label>
+  <div id="asaux"></div>
+  <button class="primary" onclick="asSave()">Сохранить</button>
+  <button class="ghost" style="margin-top:8px" onclick="document.getElementById('asdlg').close()">Отмена</button>
+  <pre id="asout"></pre>
+</dialog>
+
 <dialog id="imp">
   <h2 id="impttl">Новый профиль</h2>
   <label id="implbl">Файлы: .ovpn / .conf (+ ca.crt, ключи — можно пакетом)</label>
   <input type="file" id="files" multiple style="margin-bottom:10px">
   <label>…или вставь текст конфига</label>
   <textarea id="conftext" placeholder="client&#10;dev tun&#10;remote 1.2.3.4 1194&#10;..."></textarea>
-  <label>Логин/пароль, если провайдер их требует</label>
-  <input type="text" id="u" placeholder="логин (необязательно)" autocomplete="off">
-  <input type="password" id="p" placeholder="пароль (необязательно)" autocomplete="new-password">
-  <label>Пароль ключа, если ключ зашифрован (OpenVPN)</label>
-  <input type="password" id="kp" placeholder="пароль ключа (необязательно)" autocomplete="off">
+  <div id="ovpncred">
+    <label>Логин/пароль, если провайдер их требует</label>
+    <input type="text" id="u" placeholder="логин (необязательно)" autocomplete="off">
+    <input type="password" id="p" placeholder="пароль (необязательно)" autocomplete="new-password">
+    <label>Пароль ключа, если ключ зашифрован</label>
+    <input type="password" id="kp" placeholder="пароль ключа (необязательно)" autocomplete="off">
+  </div>
+  <div class="hint" id="wghint" style="display:none">WireGuard: ключи и адрес лежат внутри .conf —
+  логин и пароль не нужны. Нужен файл с секцией [Interface] и [Peer] либо её текст.</div>
   <label>Название профиля</label>
   <input type="text" id="nm" placeholder="например: KZ полный туннель">
   <button class="primary" onclick="doImport()">Добавить</button>
@@ -1193,7 +1267,7 @@ function render(){
     return '<div class="prof'+(sel?' sel':'')+(ax?' aux':'')+'" data-id="'+esc(x.id)+'">'+
       '<span class="dot"></span><div style="min-width:0"><div class="pname">'+esc(x.name)+'</div>'+
       '<div class="pmeta">'+esc(meta)+'</div></div>'+
-      '<div class="acts">'+key+plus+'<button class="ico" data-act="ren" title="Переименовать">✎</button>'+
+      '<div class="acts"><button class="ico" data-act="go" title="Подключить основным">▶</button>'+key+plus+
       '<button class="ico" data-act="del" title="Удалить">✕</button></div></div>';
   }
   function paintProfiles(boxId, arr, empty){
@@ -1203,11 +1277,10 @@ function render(){
     box.querySelectorAll('.prof').forEach(function(el){
       const id=el.getAttribute('data-id');
       const pr=(S.profiles||[]).filter(function(y){return y.id===id;})[0];
-      el.addEventListener('click',function(e){ if(!e.target.closest('[data-act]')) pick(id); });
-      el.querySelector('[data-act="ren"]').addEventListener('click',function(e){
-        e.stopPropagation(); askRename(id,(pr&&pr.name)||''); });
+      el.addEventListener('click',function(e){ if(!e.target.closest('[data-act]')) openProfile(id); });
       el.querySelector('[data-act="del"]').addEventListener('click',function(e){
         e.stopPropagation(); del(id); });
+      el.querySelector('[data-act="go"]').addEventListener('click',function(e){ e.stopPropagation(); pick(id); });
       const kb=el.querySelector('[data-act="key"]');
       if(kb) kb.addEventListener('click',function(e){ e.stopPropagation(); keyPass(id,(pr&&pr.has_pass)); });
       const ab=el.querySelector('[data-act="aux"]');
@@ -1223,6 +1296,142 @@ function render(){
     'Профилей OpenVPN нет — добавь .ovpn кнопкой ниже.');
   paintProfiles('profiles-wg', list.filter(function(x){return x.type!=='openvpn';}),
     'Профилей WireGuard нет — добавь .conf кнопкой ниже.');
+  renderAux();
+}
+
+// ---- статус дополнительных туннелей
+function renderAux(){
+  const box=document.getElementById('auxrows'), empty=document.getElementById('auxempty');
+  const arr=(S&&S.aux)||[];
+  box.innerHTML='';
+  empty.style.display=arr.length?'none':'block';
+  arr.forEach(function(a){
+    const d=document.createElement('div'); d.className='arow';
+    const st=a.up?'<span class="badge ok">поднят</span>':'<span class="badge bad">не поднят</span>';
+    const nets=(a.routes||[]).map(function(r){return String(r).split(' ')[0];})
+      .filter(function(x){return x&&x.indexOf(':')<0 && x.indexOf('172.')!==0 && x.indexOf('10.28.')!==0;});
+    d.innerHTML='<div class="an"><b>'+esc(a.name||a.id)+'</b><div class="ad">'+esc(a.dev||'')+
+      (a.ip?(' · '+esc(a.ip)):'')+' · '+((a.routes||[]).length)+' маршр.'+
+      (nets.length?'<br>'+esc(nets.slice(0,6).join(', '))+(nets.length>6?' …':''):'')+
+      '</div></div>'+st+
+      '<button class="ico" title="Отключить доп. туннель">✕</button>';
+    d.querySelector('button').addEventListener('click',function(){
+      this.disabled=true;
+      fetch('/api/aux_off?id='+encodeURIComponent(a.id),{method:'POST',credentials:'same-origin'})
+        .then(function(){ load(); });
+    });
+    box.appendChild(d);
+  });
+}
+
+// ---- карточка профиля: просмотр и правка
+let PD={};
+async function openProfile(id){
+  const r=await api('/api/profile_text?id='+encodeURIComponent(id));
+  if(!r||r.error){ alert((r&&r.error)||'не удалось прочитать профиль'); return; }
+  PD=r;
+  document.getElementById('pdt').textContent=(r.type==='openvpn'?'OpenVPN':'WireGuard')+' · '+esc(r.config||'');
+  let meta=(r.remotes||[]).join(', ')||'адрес сервера не найден';
+  meta+=(r.full_tunnel?' · весь трафик':' · split');
+  if(r.has_creds) meta+=' · есть логин/пароль';
+  if(r.has_pass) meta+=' · ключ под паролем';
+  if((r.missing||[]).length) meta+=' · не хватает: '+r.missing.join(', ');
+  document.getElementById('pdmeta').textContent=meta;
+  document.getElementById('pdname').value=r.name||'';
+  document.getElementById('pdtext').value=r.text||'';
+  document.getElementById('pdcreds').style.display=r.type==='openvpn'?'block':'none';
+  document.getElementById('pdkey').style.display=r.type==='openvpn'?'block':'none';
+  document.getElementById('pduser').value='';
+  document.getElementById('pdpass').value='';
+  document.getElementById('pdkp').value='';
+  const act=(S&&S.active_id)===id;
+  document.getElementById('pdauxb').style.display=(act||r.full_tunnel)?'none':'block';
+  document.getElementById('pdout').textContent='';
+  document.getElementById('pdlg').showModal();
+}
+async function pdSave(){
+  const o=document.getElementById('pdout'); o.textContent='…';
+  const r=await api('/api/profile_save',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({id:PD.id,name:document.getElementById('pdname').value.trim(),
+                         text:document.getElementById('pdtext').value})});
+  if(!r||!r.ok){ o.textContent='не сохранилось: '+((r&&r.error)||'нет ответа'); return; }
+  const u=document.getElementById('pduser').value.trim();
+  const p=document.getElementById('pdpass').value;
+  if(u&&p){
+    await api('/api/creds',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({id:PD.id,user:u,pass:p})});
+  }
+  const kp=document.getElementById('pdkp').value;
+  if(kp){
+    await api('/api/keypass',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({id:PD.id,pass:kp})});
+  }
+  o.textContent='сохранено';
+  load();
+}
+function pdConnect(){
+  const id=PD.id; document.getElementById('pdlg').close(); pick(id);
+}
+function pdAux(){
+  const id=PD.id; document.getElementById('pdlg').close();
+  fetch('/api/aux_on?id='+encodeURIComponent(id),{method:'POST',credentials:'same-origin'})
+    .then(function(){ load(); });
+}
+
+// ---- автоподключение: выбор профилей
+function asOpen(){
+  const prim=(S&&S.active_id)||'';
+  const aux=((S&&S.aux)||[]).map(function(a){return a.id;});
+  const all=(S&&S.profiles)||[];
+  const box=document.getElementById('asprimary'); box.innerHTML='';
+  all.forEach(function(p){
+    const d=document.createElement('div'); d.className='pick'+(p.id===prim?' on':'');
+    d.innerHTML='<input type="radio" name="asprim" value="'+esc(p.id)+'"'+(p.id===prim?' checked':'')+
+      '><span class="nm">'+esc(p.name)+'</span><span class="tp">'+
+      (p.type==='openvpn'?'OpenVPN':'WireGuard')+(p.full_tunnel?' · весь':'')+'</span>';
+    d.addEventListener('click',function(){
+      [].forEach.call(box.children,function(c){ c.classList.remove('on'); });
+      d.classList.add('on'); d.querySelector('input').checked=true;
+      asFillAux();
+    });
+    box.appendChild(d);
+  });
+  asFillAux();
+  document.getElementById('asout').textContent='';
+  document.getElementById('asdlg').showModal();
+}
+function asFillAux(){
+  const pr=document.querySelector('#asprimary input:checked');
+  const prim=pr?pr.value:'';
+  const aux=((S&&S.aux)||[]).map(function(a){return a.id;});
+  const ab=document.getElementById('asaux'); ab.innerHTML='';
+  ((S&&S.profiles)||[]).filter(function(p){return p.id!==prim && !p.full_tunnel;}).forEach(function(p){
+    const on=aux.indexOf(p.id)>=0;
+    const d=document.createElement('div'); d.className='pick'+(on?' on':'');
+    d.innerHTML='<input type="checkbox" value="'+esc(p.id)+'"'+(on?' checked':'')+
+      '><span class="nm">'+esc(p.name)+'</span><span class="tp">'+
+      (p.type==='openvpn'?'OpenVPN':'WireGuard')+'</span>';
+    d.addEventListener('click',function(e){
+      const c=d.querySelector('input');
+      if(e.target!==c) c.checked=!c.checked;
+      d.classList.toggle('on',c.checked);
+    });
+    ab.appendChild(d);
+  });
+  if(!ab.children.length) ab.innerHTML='<div class="hint">Других split-профилей нет.</div>';
+}
+async function asSave(){
+  const pr=document.querySelector('#asprimary input:checked');
+  if(!pr){ document.getElementById('asout').textContent='выбери основной профиль'; return; }
+  const aux=[].map.call(document.querySelectorAll('#asaux input:checked'),function(c){return c.value;});
+  const o=document.getElementById('asout'); o.textContent='…';
+  const r=await api('/api/autostart',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({primary:pr.value,aux:aux,on:true})});
+  if(r&&r.ok){
+    o.textContent='сохранено';
+    setTimeout(function(){ document.getElementById('asdlg').close(); },700);
+    load();
+  } else o.textContent='не сохранилось: '+((r&&r.error)||'нет ответа');
 }
 function esc(s){ return String(s).replace(/[&<>"]/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c];}); }
 async function toggle(){
@@ -1314,6 +1523,11 @@ function openImport(proto){
     ?'Файлы .conf (+ ключи, если лежат отдельно) или вставь текст'
     :'Файлы .ovpn (+ ca.crt, ключи — можно пакетом) или вставь текст';
   document.getElementById('files').setAttribute('accept', wg?'.conf':'*.ovpn,.ovpn');
+  document.getElementById('ovpncred').style.display=wg?'none':'block';
+  document.getElementById('wghint').style.display=wg?'block':'none';
+  document.getElementById('conftext').placeholder=wg
+    ?'[Interface] PrivateKey = ... Address = 10.0.0.2/32  /  [Peer] PublicKey = ... Endpoint = host:51820 AllowedIPs = 10.0.0.0/24'
+    :'client, dev tun, remote 1.2.3.4 1194, ...';
   document.getElementById('files').value='';
   document.getElementById('conftext').value='';
   document.getElementById('nm').value='';
@@ -1419,6 +1633,13 @@ class Handler(BaseHTTPRequestHandler):
                       "echo '--- net.log ---'; tail -10 %s/net.log 2>&1; "
                       "echo '--- ip route ---'; ip -4 route 2>&1 | head -80" % (NET_SH, DATA, DATA))
             return self._send(200, json.dumps({"diag": sh(script, timeout=40)}, ensure_ascii=False))
+        if u.path == "/api/profile_text":
+            q = parse_qs(u.query)
+            pf = profile_full((q.get("id") or [""])[0])
+            if not pf:
+                return self._send(404, json.dumps({"error": "нет такого профиля"},
+                                                  ensure_ascii=False))
+            return self._send(200, json.dumps(pf, ensure_ascii=False))
         if u.path == "/api/check":
             q = parse_qs(u.query)
             url = (q.get("url") or [""])[0]
@@ -1487,6 +1708,28 @@ class Handler(BaseHTTPRequestHandler):
             elif os.path.exists(pf):
                 os.remove(pf)
             return self._send(200, json.dumps({"ok": True, "has_pass": bool(pw)}))
+
+        if u.path == "/api/creds":
+            try:
+                o = json.loads(body.decode() or "{}")
+            except Exception:  # noqa: BLE001
+                o = {}
+            pid = str(o.get("id") or "")
+            if not profile(pid):
+                return self._send(404, json.dumps({"error": "нет такого профиля"}))
+            cf = os.path.join(profile_dir(pid), "cred.txt")
+            usr = str(o.get("user") or "")
+            pw = str(o.get("pass") or "")
+            if usr and pw:
+                write(cf, usr + "\n" + pw + "\n")
+                try:
+                    os.chmod(cf, 0o600)
+                except OSError:
+                    pass
+                return self._send(200, json.dumps({"ok": True}, ensure_ascii=False))
+            if os.path.exists(cf):
+                os.remove(cf)
+            return self._send(200, json.dumps({"ok": True}, ensure_ascii=False))
 
         if u.path in ("/api/aux_on", "/api/aux_off"):
             pid = (q.get("id") or [""])[0]
@@ -1619,6 +1862,83 @@ class Handler(BaseHTTPRequestHandler):
                 shutil.rmtree(profile_dir(pid), ignore_errors=True)
                 return self._send(200, json.dumps({"ok": True}))
             return self._send(404, json.dumps({"error": "нет такого профиля"}))
+
+        if u.path == "/api/profile_text":
+            pid = (q.get("id") or [""])[0]
+            pf = profile_full(pid)
+            if not pf:
+                return self._send(404, json.dumps({"error": "нет такого профиля"},
+                                                  ensure_ascii=False))
+            return self._send(200, json.dumps(pf, ensure_ascii=False))
+
+        if u.path == "/api/profile_save":
+            try:
+                o = json.loads(body.decode() or "{}")
+            except Exception:  # noqa: BLE001
+                o = {}
+            pid = str(o.get("id") or "")
+            p = profile(pid)
+            if not p:
+                return self._send(404, json.dumps({"error": "нет такого профиля"}))
+            name = str(o.get("name") or "").strip()
+            text = o.get("text")
+            if text is not None:
+                t = str(text)
+                if p["type"] == "openvpn" and "remote " not in t:
+                    return self._send(400, json.dumps(
+                        {"error": "в конфиге OpenVPN нет строки remote — сохранять нечего"},
+                        ensure_ascii=False))
+                if p["type"] == "wireguard" and ("[Interface]" not in t or "PrivateKey" not in t):
+                    return self._send(400, json.dumps(
+                        {"error": "в конфиге WireGuard нет [Interface]/PrivateKey"},
+                        ensure_ascii=False))
+                write(find_conf(pid), t if t.endswith("\n") else t + "\n")
+            if name:
+                d = profile_dir(pid)
+                try:
+                    pj = json.loads(read(os.path.join(d, "profile.json"), "{}") or "{}")
+                except Exception:  # noqa: BLE001
+                    pj = {}
+                pj.update({"name": name})
+                write(os.path.join(d, "profile.json"), json.dumps(pj, ensure_ascii=False))
+            return self._send(200, json.dumps({"ok": True, "profile": profile(pid)},
+                                              ensure_ascii=False))
+
+        if u.path == "/api/autostart":
+            try:
+                o = json.loads(body.decode() or "{}")
+            except Exception:  # noqa: BLE001
+                o = {}
+            prim = str(o.get("primary") or "")
+            aux = [str(x) for x in (o.get("aux") or []) if str(x)]
+            on = bool(o.get("on", True))
+            if on and not prim:
+                return self._send(400, json.dumps({"error": "выбери основной профиль"},
+                                                  ensure_ascii=False))
+            for x in aux + ([prim] if prim else []):
+                if not profile(x):
+                    return self._send(400, json.dumps({"error": "нет профиля %s" % x},
+                                                      ensure_ascii=False))
+            if prim in aux:
+                aux.remove(prim)
+            prev = state("active")
+            if prim:
+                write(os.path.join(STATE, "active"), prim)
+            write(os.path.join(STATE, "aux"), "".join(x + "\n" for x in aux))
+            if on:
+                write(os.path.join(STATE, "autostart"), "1")
+            elif os.path.exists(os.path.join(STATE, "autostart")):
+                os.remove(os.path.join(STATE, "autostart"))
+            # если туннель уже работает — приводим его к выбранному набору
+            if phase() == "on" and prim:
+                if prim != prev:
+                    threading.Thread(target=do_connect, args=(prim,), daemon=True).start()
+                else:
+                    for x in aux:
+                        net("aux", "up", x, timeout=180)
+                    for x in [a["id"] for a in aux_info() if a["id"] not in aux]:
+                        net("aux", "off", x, timeout=60)
+            return self._send(200, json.dumps({"ok": True}, ensure_ascii=False))
 
         if u.path == "/api/rename":
             pid = (q.get("id") or [""])[0]
