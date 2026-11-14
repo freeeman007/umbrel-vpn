@@ -19,7 +19,7 @@ import zlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
-VERSION = "3.4.0"
+VERSION = "3.4.1"
 DATA = os.environ.get("DATA", "/data")
 PORT = int(os.environ.get("APP_PORT", "8666"))
 NET_SH = os.path.join(DATA, "net.sh")
@@ -731,6 +731,24 @@ background:#0e1116;border-radius:10px;padding:10px;margin:8px 0 0}
 border-radius:50%;animation:r 1s linear infinite;vertical-align:-2px;margin-right:6px}
 @keyframes r{to{transform:rotate(360deg)}}
 .hint{font-size:12px;color:#7d8698;margin-top:8px}
+/* знак вопроса рядом с названием функции: пояснение показывается при наведении
+   (на тач-устройствах — по тапу, всплывает снизу экрана) */
+.kw{display:flex;align-items:center;gap:7px;min-width:0}
+.q{position:relative;flex:0 0 auto;width:15px;height:15px;border-radius:50%;border:1px solid #39414f;
+background:#1b2029;color:#7d8698;font:600 10px/1 system-ui,sans-serif;display:inline-flex;
+align-items:center;justify-content:center;cursor:help;user-select:none;-webkit-tap-highlight-color:transparent}
+.q:hover,.q:focus,.q.open{border-color:#3ddc84;color:#3ddc84;outline:none}
+.q::after{content:attr(data-tip);position:absolute;left:-6px;top:calc(100% + 8px);z-index:30;
+width:274px;padding:9px 11px;border-radius:11px;background:#1c222c;border:1px solid #333c4c;
+color:#c2cad8;font:400 12px/1.45 system-ui,sans-serif;text-align:left;box-shadow:0 12px 30px #000a;
+opacity:0;visibility:hidden;transform:translateY(-4px);pointer-events:none;
+transition:opacity .13s ease,transform .13s ease,visibility .13s}
+.q:hover::after,.q:focus::after,.q.open::after{opacity:1;visibility:visible;transform:none}
+@media (max-width:560px){
+  .q::after{position:fixed;left:12px;right:12px;top:auto;width:auto;
+    bottom:calc(14px + env(safe-area-inset-bottom));padding:11px 13px;transform:translateY(6px)}
+  .q:hover::after,.q:focus::after,.q.open::after{transform:none}
+}
 </style></head><body>
 <div class="top"><h1>VPN AZ</h1><span class="pill" id="pill">…</span></div>
 
@@ -757,16 +775,9 @@ border-radius:50%;animation:r 1s linear infinite;vertical-align:-2px;margin-righ
 
 <div class="sec">Сервис</div>
 <div class="card">
-  <div class="row"><span class="k">Перехват DNS всех приложений</span><div class="sw" id="swdns" onclick="setOpt('dns')"></div></div>
-  <div class="hint" style="margin:-2px 0 10px">Все запросы на порт 53 (UDP и TCP) от приложений Umbrel
-    уходят в локальный резолвер Umbrel, а он спрашивает 1.1.1.1 напрямую, мимо туннеля. Спасает, когда
-    VPN-сервер перехватывает DNS и отдаёт адреса, по которым ничего не открывается. DoH/DoT (443/853) не трогает.</div>
-  <div class="row"><span class="k">Автоподключение при старте</span><div class="sw" id="swauto" onclick="setOpt('auto')"></div></div>
-  <div class="hint" style="margin:-2px 0 10px">Поднимать выбранный профиль сам после перезагрузки Umbrel
-    или перезапуска приложения — даже если туннель был выключен вручную.</div>
-  <div class="row"><span class="k">NAT в домашнюю сеть</span><div class="sw" id="swlan" onclick="setOpt('lan')"></div></div>
-  <div class="hint" style="margin:-2px 0 0">Пускать клиентов VPN (10.28.0.0/22) в домашнюю сеть
-    192.168.11.0/24 через этот Umbrel: ноутбук в VPN увидит NAS, принтер, веб-морду роутера.</div>
+  <div class="row"><span class="k kw"><span>Перехват DNS всех приложений</span><span class="q" tabindex="0" role="button" aria-label="Пояснение: перехват DNS" data-tip="Все запросы на порт 53 (UDP и TCP) от приложений Umbrel уходят в локальный резолвер Umbrel, а он спрашивает 1.1.1.1 напрямую, мимо туннеля. Спасает, когда VPN-сервер перехватывает DNS и отдаёт адреса, по которым ничего не открывается. DoH/DoT (порты 443 и 853) не трогает.">?</span></span><div class="sw" id="swdns" onclick="setOpt('dns')"></div></div>
+  <div class="row"><span class="k kw"><span>Автоподключение при старте</span><span class="q" tabindex="0" role="button" aria-label="Пояснение: автоподключение при старте" data-tip="Поднимать выбранный профиль сам после перезагрузки Umbrel или перезапуска приложения. Туннель, выключенный вручную, сам не включится.">?</span></span><div class="sw" id="swauto" onclick="setOpt('auto')"></div></div>
+  <div class="row"><span class="k kw"><span>NAT в домашнюю сеть</span><span class="q" tabindex="0" role="button" aria-label="Пояснение: NAT в домашнюю сеть" data-tip="Пускать клиентов VPN (10.28.0.0/22) в домашнюю сеть 192.168.11.0/24 через этот Umbrel: ноутбук в VPN увидит NAS, принтер, веб-морду роутера.">?</span></span><div class="sw" id="swlan" onclick="setOpt('lan')"></div></div>
 </div>
 <div class="hint bad" id="warn" style="display:none"></div>
 <button class="ghost" onclick="diag()">Диагностика и журнал</button>
@@ -916,6 +927,19 @@ async function diag(){
   const o=document.getElementById('diagout'); o.textContent='…';
   const j=await api('/api/diag'); o.textContent=j.diag||'нет данных';
 }
+// пояснения к функциям: на десктопе показываются при наведении (CSS :hover),
+// на тач-экранах наведения нет — включаем по тапу, закрываем по тапу мимо или Esc
+document.addEventListener('click',function(e){
+  var q=e.target.closest?e.target.closest('.q'):null, all=document.querySelectorAll('.q.open');
+  for(var i=0;i<all.length;i++){ if(all[i]!==q) all[i].classList.remove('open'); }
+  if(q) q.classList.toggle('open');
+});
+document.addEventListener('keydown',function(e){
+  if(e.key==='Escape'||e.keyCode===27){
+    var all=document.querySelectorAll('.q.open');
+    for(var i=0;i<all.length;i++) all[i].classList.remove('open');
+  }
+});
 load(); setInterval(load,3000);
 document.addEventListener('visibilitychange',function(){ if(!document.hidden) load(); });
 </script></body></html>"""
