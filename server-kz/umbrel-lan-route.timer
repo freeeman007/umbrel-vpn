@@ -1,0 +1,9 @@
+[Unit]
+Description=Обновление маршрута в домашнюю сеть Umbrel (каждые 15 с)
+
+[Timer]
+OnBootSec=20
+OnUnitActiveSec=15
+
+[Install]
+WantedBy=timers.target

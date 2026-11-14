@@ -1,0 +1,7 @@
+[Unit]
+Description=Маршрут в домашнюю сеть Umbrel через его адрес в туннеле
+After=openvpn-server@antizapret-udp.service
+
+[Service]
+Type=oneshot
+ExecStart=/root/antizapret/umbrel-lan-route.sh

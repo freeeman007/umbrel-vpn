@@ -325,6 +325,20 @@ dnat_off() {
 # ---------------------------------------------------------------- NAT в LAN
 lan_access_wanted() { [ -f "$STATE/lan_access" ] ; }
 
+# Подсети активного туннеля. Пул клиентов задаёт сервер и он не всегда равен
+# AZ_VPN_SUBNET (KZ выдаёт 10.29.0.0/22, AZ-шный WG — 10.29.8.0/24), поэтому
+# берём реальную сеть с интерфейса: иначе MASQUERADE не покрывает клиентов
+# и ответы из домашней сети уходят в никуда.
+tunnel_nets() {
+    _nets="$VPN_SUBNET"
+    _d=$(tun_dev)
+    [ -n "$_d" ] || { echo "$_nets"; return 0 ; }
+    for _n in $(ip -4 route show dev "$_d" scope link 2>/dev/null | awk '$1 ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+\/[0-9]+$/ {print $1}'); do
+        case " $_nets " in *" $_n "*) ;; *) _nets="$_nets $_n" ;; esac
+    done
+    echo "$_nets"
+}
+
 lan_access_on() {
     lan_info
     echo 1 > /proc/sys/net/ipv4/ip_forward 2>/dev/null || true
@@ -332,8 +346,12 @@ lan_access_on() {
         rule_ensure filter FORWARD -i "$_d" -j ACCEPT
         rule_ensure filter FORWARD -o "$_d" -j ACCEPT
     done
-    [ -n "${LAN_IF:-}" ] && rule_ensure nat POSTROUTING -s "$VPN_SUBNET" -o "$LAN_IF" -j MASQUERADE
-    log "lan: NAT $VPN_SUBNET -> $LAN_IF"
+    : > "$STATE/lan_nets"
+    for _n in $(tunnel_nets); do
+        echo "$_n" >> "$STATE/lan_nets"
+        [ -n "${LAN_IF:-}" ] && rule_ensure nat POSTROUTING -s "$_n" -o "$LAN_IF" -j MASQUERADE
+    done
+    log "lan: NAT $(tr '\n' ' ' < "$STATE/lan_nets" | sed 's/ $//') -> $LAN_IF"
 }
 
 lan_access_off() {
@@ -342,7 +360,13 @@ lan_access_off() {
         rule_del filter FORWARD -o "$_d" -j ACCEPT
     done
     lan_info
-    [ -n "${LAN_IF:-}" ] && rule_del nat POSTROUTING -s "$VPN_SUBNET" -o "$LAN_IF" -j MASQUERADE
+    # снимаем по записанному списку: после отключения туннеля подсеть с интерфейса уже не прочитать
+    _list=$(cat "$STATE/lan_nets" 2>/dev/null)
+    [ -n "$_list" ] || _list="$VPN_SUBNET"
+    for _n in $_list; do
+        [ -n "${LAN_IF:-}" ] && rule_del nat POSTROUTING -s "$_n" -o "$LAN_IF" -j MASQUERADE
+    done
+    rm -f "$STATE/lan_nets"
 }
 
 # ---------------------------------------------------------------- проба и откат
