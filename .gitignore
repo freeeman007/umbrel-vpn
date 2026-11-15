@@ -1,0 +1,10 @@
+# Локальные значения (адреса домашней сети, имена интерфейсов) — не в репозиторий.
+local.env
+local.env.*
+!local.env.example
+
+__pycache__/
+*.pyc
+
+# генерируется тестом: cp scripts/net.sh net_up.sh
+vpn-az/tests/guard/net_up.sh

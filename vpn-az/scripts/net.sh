@@ -285,7 +285,7 @@ dev_aux() { # dev_aux <id> <type>
     if [ "$2" = wg ]; then printf 'wg%s' "$_s" ; else printf 'azp%s' "$_s" ; fi
 }
 # в списке допустимы только id профилей; строки с пробелами/слэшами (мусор от гонок
-# записи) игнорируем — иначе сторож пытался «поднять» адрес вида «192.168.11.126 24»
+# записи) игнорируем — иначе сторож пытался «поднять» адрес вида «192.168.1.5 24»
 aux_list()  { [ -f "$STATE/aux" ] \
               && sed -n 's/^[[:space:]]*//; s/[[:space:]]*$//; /^[A-Za-z0-9._-][A-Za-z0-9._-]*$/p' "$STATE/aux" ; }
 aux_has()   { aux_list 2>/dev/null | grep -Fqx "$1" ; }
@@ -652,9 +652,10 @@ tunnel_dns_off() {
 
 # dns_probe — резолвится ли имя обычным путём (через локальный шлюз), 3 попытки по 5 с
 dns_probe() {
+    _srv="${LAN_GW:-$(ip -4 route show default 2>/dev/null | awk '{print $3; exit}')}"
     _i=0
     while [ "$_i" -lt 3 ]; do
-        nslookup example.com "${LAN_GW:-192.168.11.1}" >/dev/null 2>&1 && return 0
+        [ -n "$_srv" ] && nslookup example.com "$_srv" >/dev/null 2>&1 && return 0
         sleep 5; _i=$((_i+1))
     done
     return 1
